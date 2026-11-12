@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 from fake_makia import RUN_SECRET, SYNC_SECRET
 
-from makia_bridge import cli
-from makia_bridge.api import MakiaClient
+from makia_integration import cli
+from makia_integration.api import MakiaClient
 
 
 @pytest.fixture
@@ -24,7 +24,7 @@ def run(makia, monkeypatch, capsys):
     return go
 
 
-CREATE = ["create", "--name", "bridge", "--connection", "c-1", "--path", "/hook"]
+CREATE = ["create", "--name", "integration", "--connection", "c-1", "--path", "/hook"]
 
 
 def test_create_prints_secret_once_and_sends_filters(run, makia):
@@ -38,7 +38,7 @@ def test_create_prints_secret_once_and_sends_filters(run, makia):
         (
             "POST",
             {
-                "name": "bridge",
+                "name": "integration",
                 "connection_id": "c-1",
                 "path": "/hook",
                 "projects": ["p1", "p2"],
@@ -52,13 +52,17 @@ def test_create_prints_secret_once_and_sends_filters(run, makia):
 
 def test_create_without_filters_sends_none(run, makia):
     run(*CREATE)
-    assert makia.webhook_bodies[0][1] == {"name": "bridge", "connection_id": "c-1", "path": "/hook"}
+    assert makia.webhook_bodies[0][1] == {
+        "name": "integration",
+        "connection_id": "c-1",
+        "path": "/hook",
+    }
 
 
 def test_list(run):
     run(*CREATE, "--project", "p1")
     out = run("list")
-    assert "wh-1" in out and "bridge" in out and "enabled=true" in out
+    assert "wh-1" in out and "integration" in out and "enabled=true" in out
     assert "switched_off_reason=-" in out and '"projects": ["p1"]' in out and "last_seq=0" in out
 
 

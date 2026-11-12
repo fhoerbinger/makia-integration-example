@@ -1,4 +1,4 @@
--- The customer's side. In a real bridge these are views over the source system.
+-- The customer's side. In a real integration these are views over the source system.
 CREATE TABLE IF NOT EXISTS src_projects (
   external_id TEXT PRIMARY KEY,
   name        TEXT NOT NULL,
@@ -22,12 +22,12 @@ CREATE TABLE IF NOT EXISTS src_record_files (
   PRIMARY KEY (record_external_id, path)
 );
 
--- The bridge's own tables.
-CREATE TABLE IF NOT EXISTS bridge_state (
+-- The integration's own tables.
+CREATE TABLE IF NOT EXISTS integration_state (
   name  TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS bridge_runs (
+CREATE TABLE IF NOT EXISTS integration_runs (
   record_external_id TEXT PRIMARY KEY,
   case_id            TEXT,
   run_id             TEXT,
@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS bridge_runs (
   progress_json      TEXT,            -- last GET /runs/{id}/progress answer
   progress_at        TEXT             -- when it was read
 );
-CREATE TABLE IF NOT EXISTS bridge_results (
+CREATE TABLE IF NOT EXISTS integration_results (
   run_id         TEXT NOT NULL,
   view_key       TEXT NOT NULL,
   unit_key       TEXT NOT NULL,

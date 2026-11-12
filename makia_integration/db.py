@@ -1,4 +1,4 @@
-"""The bridge's database: the customer's tables it reads and its own tables.
+"""The integration's database: the customer's tables it reads and its own tables.
 
 Plain DB-API with `?` parameters, which both `sqlite3` and `pyodbc` (MS SQL)
 understand. Writes use UPDATE-then-INSERT instead of a vendor upsert, so the
@@ -27,7 +27,7 @@ def connect(url: str) -> tuple[Connection, str]:
         import pyodbc  # optional dependency: pip install .[mssql]
 
         return pyodbc.connect(url.removeprefix("odbc:")), "mssql"
-    # `bridge listen` builds the connection on the main thread but polls on the
+    # `makia-integration listen` builds the connection on the main thread but polls on the
     # coalescer's one worker thread. Only that thread touches it afterwards (polls
     # never overlap), so sharing it across threads is safe.
     return sqlite3.connect(url, check_same_thread=False), "sqlite"
@@ -74,9 +74,9 @@ def upsert(conn: Connection, table: str, key: dict[str, Any], values: dict[str, 
 
 
 def get_state(conn: Connection, name: str) -> str | None:
-    found = rows(conn, "SELECT value FROM bridge_state WHERE name = ?", name)
+    found = rows(conn, "SELECT value FROM integration_state WHERE name = ?", name)
     return found[0][0] if found else None
 
 
 def set_state(conn: Connection, name: str, value: str) -> None:
-    upsert(conn, "bridge_state", {"name": name}, {"value": value})
+    upsert(conn, "integration_state", {"name": name}, {"value": value})

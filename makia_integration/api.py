@@ -1,6 +1,6 @@
-"""A thin client for the parts of MAKIA's stable API a bridge uses.
+"""A thin client for the parts of MAKIA's stable API an integration uses.
 
-Every route the bridge calls is listed in ROUTES_USED; a test checks each one
+Every route the integration calls is listed in ROUTES_USED; a test checks each one
 against MAKIA's published API description (openapi.json).
 """
 

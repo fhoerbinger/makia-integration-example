@@ -1,4 +1,4 @@
-"""`bridge init-db | sync | send | poll | listen | run | webhook`. Configuration comes from the
+"""`makia-integration init-db | sync | send | poll | listen | run | webhook`. Configuration comes from the
 environment (see README.md)."""
 
 from __future__ import annotations
@@ -14,20 +14,20 @@ import time
 from .api import ApiError, MakiaClient
 from .db import create_schema
 from .db import connect as db_connect
-from .jobs import Bridge
+from .jobs import Integration
 
 
 def _env(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
-        sys.exit(f"bridge: set {name} (see README.md)")
+        sys.exit(f"makia-integration: set {name} (see README.md)")
     return value
 
 
-def _bridge() -> Bridge:
-    conn, _ = db_connect(os.environ.get("BRIDGE_DB", "bridge.db"))
+def _integration() -> Integration:
+    conn, _ = db_connect(os.environ.get("INTEGRATION_DB", "integration.db"))
     url = _env("MAKIA_API_URL")
-    return Bridge(
+    return Integration(
         conn=conn,
         sync_api=MakiaClient(url, _env("MAKIA_SYNC_TOKEN")),
         run_api=MakiaClient(url, _env("MAKIA_RUN_TOKEN")),
@@ -106,15 +106,15 @@ def _webhook(args: argparse.Namespace) -> None:
                     f"error={d['last_error'] or '-'}"
                 )
     except ApiError as e:
-        sys.exit(f"bridge: {e.code} (HTTP {e.status})")
+        sys.exit(f"integration: {e.code} (HTTP {e.status})")
     finally:
         api.close()
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="bridge", description=__doc__)
+    parser = argparse.ArgumentParser(prog="makia-integration", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("init-db", help="create the source and bridge tables")
+    sub.add_parser("init-db", help="create the source and integration tables")
     sub.add_parser("sync", help="send projects and members")
     sub.add_parser("send", help="start runs for new records")
     sub.add_parser("poll", help="read the change feed and copy results")
@@ -130,7 +130,7 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     if args.command == "init-db":
-        conn, dialect = db_connect(os.environ.get("BRIDGE_DB", "bridge.db"))
+        conn, dialect = db_connect(os.environ.get("INTEGRATION_DB", "integration.db"))
         create_schema(conn, dialect)
         return
 
@@ -138,24 +138,24 @@ def main(argv: list[str] | None = None) -> None:
         _webhook(args)
         return
 
-    bridge = _bridge()
+    integration = _integration()
     if args.command == "sync":
-        bridge.sync()
+        integration.sync()
     elif args.command == "send":
-        bridge.send()
+        integration.send()
     elif args.command == "poll":
-        bridge.poll()
+        integration.poll()
     elif args.command == "listen":
         from .receiver import serve
 
-        serve(bridge, _env("MAKIA_WEBHOOK_SECRET"), args.port)
+        serve(integration, _env("MAKIA_WEBHOOK_SECRET"), args.port)
     else:
         round_no = 0
         while True:
             if round_no % args.sync_every == 0:
-                bridge.sync()
-            bridge.send()
-            bridge.poll()
+                integration.sync()
+            integration.send()
+            integration.poll()
             round_no += 1
             time.sleep(args.interval)
 

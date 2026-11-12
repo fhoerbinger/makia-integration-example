@@ -1,4 +1,4 @@
-"""Every route the bridge calls exists in MAKIA's API description.
+"""Every route the integration calls exists in MAKIA's API description.
 
 In the MAKIA repository it reads apps/audit-api/openapi.json; the published
 example carries a copy as openapi.json at its root. MAKIA_OPENAPI overrides both
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from makia_bridge.api import ROUTES_USED
+from makia_integration.api import ROUTES_USED
 
 _HERE = Path(__file__).resolve()
 IN_MONOREPO = _HERE.parents[3] / "apps" / "audit-api" / "openapi.json"
@@ -37,17 +37,17 @@ def test_route_exists(method, path):
     assert method.lower() in paths[path], f"{method} {path} is not in MAKIA's API"
 
 
-def test_every_call_is_a_listed_route(bridge, makia):
-    """Drive every job once; each request the bridge sent must match a route
+def test_every_call_is_a_listed_route(integration, makia):
+    """Drive every job once; each request the integration sent must match a route
     in ROUTES_USED, so the openapi check above covers all of them."""
     from fake_makia import row
 
-    bridge.sync()
-    bridge.send()
-    bridge.poll()
+    integration.sync()
+    integration.send()
+    integration.poll()
     makia.set_rows("run-1", "mapping", [row("a")])
     makia.emit("run.views_built", run_id="run-1", views=["mapping"], rebuilt=False)
-    bridge.poll()
+    integration.poll()
     patterns = [
         (m, re.compile("^" + re.sub(r"\\{[^}]+\\}", "[^/]+", re.escape(p)) + "$"))
         for m, p in ROUTES_USED

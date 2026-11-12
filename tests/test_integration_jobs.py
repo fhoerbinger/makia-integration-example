@@ -5,14 +5,14 @@ import json
 import pytest
 from fake_makia import RUN_ACCOUNT_ID, progress, row
 
-from makia_bridge.api import ApiError
-from makia_bridge.db import get_state, rows
+from makia_integration.api import ApiError
+from makia_integration.db import get_state, rows
 
 
-def results(bridge, run_id="run-1", view="mapping"):
+def results(integration, run_id="run-1", view="mapping"):
     return rows(
-        bridge.conn,
-        "SELECT unit_key, review_state, review_option, data_json FROM bridge_results "
+        integration.conn,
+        "SELECT unit_key, review_state, review_option, data_json FROM integration_results "
         "WHERE run_id = ? AND view_key = ? ORDER BY unit_key",
         run_id,
         view,
@@ -22,8 +22,8 @@ def results(bridge, run_id="run-1", view="mapping"):
 # --- sync ---------------------------------------------------------------------
 
 
-def test_sync_sends_full_state_with_the_run_account(bridge, makia):
-    bridge.sync()
+def test_sync_sends_full_state_with_the_run_account(integration, makia):
+    integration.sync()
     p = makia.projects["2026-114"]
     assert p["name"] == "Engagement 2026-114" and p["archived"] is False
     assert {"service_account": RUN_ACCOUNT_ID, "permissions": ["cases", "run", "review"]} in p[
@@ -33,17 +33,17 @@ def test_sync_sends_full_state_with_the_run_account(bridge, makia):
     assert makia.projects["2025-087"]["archived"] is True
 
 
-def test_sync_twice_changes_nothing(bridge, makia):
-    bridge.sync()
+def test_sync_twice_changes_nothing(integration, makia):
+    integration.sync()
     before = dict(makia.projects)
-    bridge.sync()
+    integration.sync()
     assert makia.projects == before
 
 
-def test_project_gone_from_source_is_not_archived_by_absence(bridge, makia, caplog):
-    bridge.sync()
-    bridge.conn.execute("DELETE FROM src_projects WHERE external_id = '2026-114'")
-    bridge.sync()
+def test_project_gone_from_source_is_not_archived_by_absence(integration, makia, caplog):
+    integration.sync()
+    integration.conn.execute("DELETE FROM src_projects WHERE external_id = '2026-114'")
+    integration.sync()
     assert makia.projects["2026-114"]["archived"] is False
     assert "no longer in the source" in caplog.text
 
@@ -51,36 +51,37 @@ def test_project_gone_from_source_is_not_archived_by_absence(bridge, makia, capl
 # --- send ---------------------------------------------------------------------
 
 
-def test_send_starts_one_run_per_record_and_stores_the_link(bridge, makia):
-    bridge.sync()
-    bridge.send()
+def test_send_starts_one_run_per_record_and_stores_the_link(integration, makia):
+    integration.sync()
+    integration.send()
     sent = rows(
-        bridge.conn,
-        "SELECT record_external_id, run_id, review_url, status FROM bridge_runs ORDER BY 1",
+        integration.conn,
+        "SELECT record_external_id, run_id, review_url, status FROM integration_runs ORDER BY 1",
     )
     assert [r[0] for r in sent] == ["DOC-77812", "DOC-77813"]
     assert all(r[3] == "sent" and r[2].startswith("https://studio.example/") for r in sent)
-    bridge.send()  # nothing new
+    integration.send()  # nothing new
     assert sum(1 for c in makia.calls if c[1].startswith("/inbound/")) == 2
 
 
-def test_lost_answer_is_recovered_by_sending_again(bridge, makia):
-    bridge.sync()
-    bridge.send()
-    bridge.conn.execute("DELETE FROM bridge_runs WHERE record_external_id = 'DOC-77812'")
-    bridge.send()
+def test_lost_answer_is_recovered_by_sending_again(integration, makia):
+    integration.sync()
+    integration.send()
+    integration.conn.execute("DELETE FROM integration_runs WHERE record_external_id = 'DOC-77812'")
+    integration.send()
     run_id = rows(
-        bridge.conn, "SELECT run_id FROM bridge_runs WHERE record_external_id = 'DOC-77812'"
+        integration.conn,
+        "SELECT run_id FROM integration_runs WHERE record_external_id = 'DOC-77812'",
     )[0][0]
     assert run_id == "run-1"
     assert len(makia.cases) == 2
 
 
-def test_archived_project_marks_the_record_refused(bridge, makia):
-    bridge.sync()
+def test_archived_project_marks_the_record_refused(integration, makia):
+    integration.sync()
     makia.projects["2026-114"]["archived"] = True
-    bridge.send()
-    assert rows(bridge.conn, "SELECT DISTINCT status, error_code FROM bridge_runs") == [
+    integration.send()
+    assert rows(integration.conn, "SELECT DISTINCT status, error_code FROM integration_runs") == [
         ("refused", "project_archived")
     ]
 
@@ -88,7 +89,7 @@ def test_archived_project_marks_the_record_refused(bridge, makia):
 def test_sync_token_is_refused_by_inbound(makia):
     from fake_makia import SYNC_SECRET
 
-    from makia_bridge.api import MakiaClient
+    from makia_integration.api import MakiaClient
 
     client = MakiaClient("https://makia.example", SYNC_SECRET, transport=makia.transport())
     with pytest.raises(ApiError) as err:
@@ -99,67 +100,67 @@ def test_sync_token_is_refused_by_inbound(makia):
 # --- poll ---------------------------------------------------------------------
 
 
-def test_first_poll_starts_at_the_head(bridge, makia):
+def test_first_poll_starts_at_the_head(integration, makia):
     makia.emit("run.succeeded", run_id="old", status="succeeded")
-    bridge.poll()
-    assert get_state(bridge.conn, "feed_marker") == "1"
+    integration.poll()
+    assert get_state(integration.conn, "feed_marker") == "1"
 
 
-def test_a_run_finished_before_the_first_poll_is_not_missed(bridge, makia):
+def test_a_run_finished_before_the_first_poll_is_not_missed(integration, makia):
     makia.emit("run.succeeded", run_id="old", status="succeeded")
-    bridge.sync()
-    bridge.send()  # a new bridge stores the head before its first send
+    integration.sync()
+    integration.send()  # a new integration stores the head before its first send
     makia.emit("run.failed", run_id="run-1", status="failed", error_code=None)
-    bridge.poll()
-    assert rows(bridge.conn, "SELECT status FROM bridge_runs WHERE run_id = 'run-1'") == [
+    integration.poll()
+    assert rows(integration.conn, "SELECT status FROM integration_runs WHERE run_id = 'run-1'") == [
         ("failed",)
     ]
 
 
-def started(bridge, makia):
-    bridge.sync()
-    bridge.send()
-    bridge.poll()  # marker at the head
+def started(integration, makia):
+    integration.sync()
+    integration.send()
+    integration.poll()  # marker at the head
 
 
-def test_views_built_copies_the_results(bridge, makia):
-    started(bridge, makia)
+def test_views_built_copies_the_results(integration, makia):
+    started(integration, makia)
     makia.set_rows("run-1", "mapping", [row("a"), row("b")])
     makia.emit("run.succeeded", run_id="run-1", status="succeeded")
     makia.emit("run.views_built", run_id="run-1", views=["mapping"], rebuilt=False)
-    bridge.poll()
-    assert [r[0] for r in results(bridge)] == ["a", "b"]
-    assert rows(bridge.conn, "SELECT status FROM bridge_runs WHERE run_id = 'run-1'") == [
+    integration.poll()
+    assert [r[0] for r in results(integration)] == ["a", "b"]
+    assert rows(integration.conn, "SELECT status FROM integration_runs WHERE run_id = 'run-1'") == [
         ("succeeded",)
     ]
-    assert get_state(bridge.conn, "feed_marker") == "2"
+    assert get_state(integration.conn, "feed_marker") == "2"
 
 
-def test_failed_inbound_run_keeps_its_reason(bridge, makia):
-    started(bridge, makia)
+def test_failed_inbound_run_keeps_its_reason(integration, makia):
+    started(integration, makia)
     makia.emit("run.failed", run_id="run-2", status="failed", error_code="inbound_import_empty")
-    bridge.poll()
+    integration.poll()
     assert rows(
-        bridge.conn, "SELECT status, error_code FROM bridge_runs WHERE run_id = 'run-2'"
+        integration.conn, "SELECT status, error_code FROM integration_runs WHERE run_id = 'run-2'"
     ) == [("failed", "inbound_import_empty")]
 
 
-def test_review_is_read_again(bridge, makia):
-    started(bridge, makia)
+def test_review_is_read_again(integration, makia):
+    started(integration, makia)
     makia.set_rows("run-1", "mapping", [row("a")])
     makia.emit("run.views_built", run_id="run-1", views=["mapping"], rebuilt=False)
-    bridge.poll()
+    integration.poll()
     makia.set_rows("run-1", "mapping", [row("a", state="decided", option="cleared")])
     makia.emit("row.reviewed", run_id="run-1", view="mapping", row_key="a", verdict="cleared")
-    bridge.poll()
-    assert results(bridge)[0][1:3] == ("decided", "cleared")
+    integration.poll()
+    assert results(integration)[0][1:3] == ("decided", "cleared")
 
 
-def test_match_decision_rereads_every_run_of_the_case(bridge, makia):
-    started(bridge, makia)
+def test_match_decision_rereads_every_run_of_the_case(integration, makia):
+    started(integration, makia)
     makia.set_rows("run-1", "mapping", [row("a")])
     makia.emit("run.views_built", run_id="run-1", views=["mapping"], rebuilt=False)
-    bridge.poll()
+    integration.poll()
     makia.set_rows("run-1", "mapping", [row("a", konto="9999")])
     makia.emit(
         "match.changed",
@@ -169,84 +170,84 @@ def test_match_decision_rereads_every_run_of_the_case(bridge, makia):
         booking_id="b",
         verdict="confirm",
     )
-    bridge.poll()
-    assert json.loads(results(bridge)[0][3]) == {"konto": "9999"}
+    integration.poll()
+    assert json.loads(results(integration)[0][3]) == {"konto": "9999"}
 
 
-def test_paging_and_a_rebuild_mid_read(bridge, makia):
-    started(bridge, makia)
+def test_paging_and_a_rebuild_mid_read(integration, makia):
+    started(integration, makia)
     makia.set_rows("run-1", "mapping", [row(f"r{i:03}") for i in range(1200)])
     makia.rebuild_once.add(("run-1", "mapping"))
     makia.emit("run.views_built", run_id="run-1", views=["mapping"], rebuilt=False)
-    bridge.poll()
-    assert len(results(bridge)) == 1200
+    integration.poll()
+    assert len(results(integration)) == 1200
 
 
-def test_rows_a_rebuild_dropped_are_removed(bridge, makia):
-    started(bridge, makia)
+def test_rows_a_rebuild_dropped_are_removed(integration, makia):
+    started(integration, makia)
     makia.set_rows("run-1", "mapping", [row("a"), row("b")], generation="g1")
     makia.emit("run.views_built", run_id="run-1", views=["mapping"], rebuilt=False)
-    bridge.poll()
+    integration.poll()
     makia.set_rows("run-1", "mapping", [row("a")], generation="g2")
     makia.emit("run.views_built", run_id="run-1", views=["mapping"], rebuilt=True)
-    bridge.poll()
-    assert [r[0] for r in results(bridge)] == ["a"]
+    integration.poll()
+    assert [r[0] for r in results(integration)] == ["a"]
 
 
-def test_runs_of_other_systems_are_ignored(bridge, makia):
-    started(bridge, makia)
+def test_runs_of_other_systems_are_ignored(integration, makia):
+    started(integration, makia)
     makia.set_rows("foreign", "mapping", [row("a")])
     makia.emit("run.views_built", run_id="foreign", views=["mapping"], rebuilt=False)
-    bridge.poll()
-    assert results(bridge, run_id="foreign") == []
+    integration.poll()
+    assert results(integration, run_id="foreign") == []
 
 
-def test_expired_access_token_is_swapped_again(bridge, makia):
-    started(bridge, makia)
+def test_expired_access_token_is_swapped_again(integration, makia):
+    started(integration, makia)
     swaps = makia.swaps
     makia.expire_next = True
     makia.emit("run.cancelled", run_id="run-1", status="cancelled")
-    bridge.poll()
+    integration.poll()
     assert makia.swaps == swaps + 1
-    assert rows(bridge.conn, "SELECT status FROM bridge_runs WHERE run_id = 'run-1'") == [
+    assert rows(integration.conn, "SELECT status FROM integration_runs WHERE run_id = 'run-1'") == [
         ("cancelled",)
     ]
 
 
-def test_feed_is_drained_across_pages(bridge, makia):
-    started(bridge, makia)
+def test_feed_is_drained_across_pages(integration, makia):
+    started(integration, makia)
     for _ in range(250):
         makia.emit("finding.changed", run_id="run-1", finding_id="f", status="confirmed")
-    bridge.poll()
-    assert get_state(bridge.conn, "feed_marker") == "250"
+    integration.poll()
+    assert get_state(integration.conn, "feed_marker") == "250"
 
 
 # --- run progress -------------------------------------------------------------
 
 
-def status_of(bridge, run_id="run-1"):
+def status_of(integration, run_id="run-1"):
     return rows(
-        bridge.conn,
-        "SELECT status, progress_json, progress_at FROM bridge_runs WHERE run_id = ?",
+        integration.conn,
+        "SELECT status, progress_json, progress_at FROM integration_runs WHERE run_id = ?",
         run_id,
     )[0]
 
 
-def test_progress_marks_a_sent_run_running(bridge, makia):
-    started(bridge, makia)
+def test_progress_marks_a_sent_run_running(integration, makia):
+    started(integration, makia)
     makia.progress["run-1"] = progress("run-1", "running", done=3, count=10)
-    bridge.poll()
-    status, stored, at = status_of(bridge)
+    integration.poll()
+    status, stored, at = status_of(integration)
     assert status == "running" and at
     assert json.loads(stored)["running"] == [
         {"node_id": "extract", "items_done": 3, "item_count": 10}
     ]
     # run-2 has no snapshot yet (404): left alone.
-    assert status_of(bridge, "run-2")[0] == "sent"
+    assert status_of(integration, "run-2")[0] == "sent"
 
 
-def recovered(bridge, makia, status):
-    """DOC-77812's case: the run ended before this bridge's marker (a bridge
+def recovered(integration, makia, status):
+    """DOC-77812's case: the run ended before this integration's marker (an integration
     whose database was lost sends the record again and gets the known run), so
     the feed never brings its outcome."""
     makia.cases["DOC-77812"] = {
@@ -256,76 +257,76 @@ def recovered(bridge, makia, status):
         "review_url": "https://studio.example/runs/run-1",
     }
     makia.emit("run.succeeded", run_id="run-1", status=status)  # before the marker
-    bridge.sync()
-    bridge.send()  # 200: the known case and its run
+    integration.sync()
+    integration.send()  # 200: the known case and its run
     makia.progress["run-1"] = progress("run-1", status)
 
 
-def test_a_known_run_that_already_succeeded_is_caught_up(bridge, makia):
+def test_a_known_run_that_already_succeeded_is_caught_up(integration, makia):
     makia.set_rows("run-1", "mapping", [row("a"), row("b")])
-    recovered(bridge, makia, "succeeded")
-    bridge.poll()
-    assert rows(bridge.conn, "SELECT status FROM bridge_runs WHERE run_id = 'run-1'") == [
+    recovered(integration, makia, "succeeded")
+    integration.poll()
+    assert rows(integration.conn, "SELECT status FROM integration_runs WHERE run_id = 'run-1'") == [
         ("succeeded",)
     ]
-    assert [r[0] for r in results(bridge)] == ["a", "b"]
-    bridge.poll()  # a finished run is not read again
+    assert [r[0] for r in results(integration)] == ["a", "b"]
+    integration.poll()  # a finished run is not read again
     assert makia.calls.count(("GET", "/runs/run-1/progress")) == 1
 
 
-def test_a_known_run_that_already_failed_is_caught_up(bridge, makia):
-    recovered(bridge, makia, "failed")
-    bridge.poll()
-    assert rows(bridge.conn, "SELECT status FROM bridge_runs WHERE run_id = 'run-1'") == [
+def test_a_known_run_that_already_failed_is_caught_up(integration, makia):
+    recovered(integration, makia, "failed")
+    integration.poll()
+    assert rows(integration.conn, "SELECT status FROM integration_runs WHERE run_id = 'run-1'") == [
         ("failed",)
     ]
     assert ("GET", "/runs/run-1/views") not in makia.calls
 
 
-def test_final_status_not_overwritten_by_progress(bridge, makia):
-    started(bridge, makia)
+def test_final_status_not_overwritten_by_progress(integration, makia):
+    started(integration, makia)
     makia.progress["run-1"] = progress("run-1", "running")
     makia.emit("run.succeeded", run_id="run-1", status="succeeded")
-    bridge.poll()  # feed first: succeeded; the open-run query then skips run-1
-    assert status_of(bridge)[0] == "succeeded"
+    integration.poll()  # feed first: succeeded; the open-run query then skips run-1
+    assert status_of(integration)[0] == "succeeded"
     # A progress read that was already in flight (run-1 looked open) answers "running":
     # the UPDATE's guard keeps the finished run finished.
-    bridge.run_api.run_progress = lambda run_id: progress(run_id, "running")
+    integration.run_api.run_progress = lambda run_id: progress(run_id, "running")
     real_rows = rows
 
-    import makia_bridge.jobs as jobs
+    import makia_integration.jobs as jobs
 
     jobs.rows = lambda conn, sql, *p: (
         [("run-1",)] if "progress_at" in sql else real_rows(conn, sql, *p)
     )
     try:
-        bridge._read_progress()
+        integration._read_progress()
     finally:
         jobs.rows = real_rows
-    assert status_of(bridge)[0] == "succeeded"
+    assert status_of(integration)[0] == "succeeded"
 
 
-def test_failing_progress_reads_rotate_to_the_back(bridge, makia):
-    started(bridge, makia)  # no snapshots in the fake: both reads 404
-    bridge.poll()
-    assert all(at for (at,) in rows(bridge.conn, "SELECT progress_at FROM bridge_runs"))
+def test_failing_progress_reads_rotate_to_the_back(integration, makia):
+    started(integration, makia)  # no snapshots in the fake: both reads 404
+    integration.poll()
+    assert all(at for (at,) in rows(integration.conn, "SELECT progress_at FROM integration_runs"))
 
 
-def test_at_most_50_progress_reads_per_poll(bridge, makia):
-    started(bridge, makia)
+def test_at_most_50_progress_reads_per_poll(integration, makia):
+    started(integration, makia)
     for n in range(60):
-        bridge.conn.execute(
-            "INSERT INTO bridge_runs (record_external_id, run_id, status) VALUES (?, ?, 'sent')",
+        integration.conn.execute(
+            "INSERT INTO integration_runs (record_external_id, run_id, status) VALUES (?, ?, 'sent')",
             (f"X{n}", f"bulk-{n}"),
         )
         makia.progress[f"bulk-{n}"] = progress(f"bulk-{n}")
     makia.calls.clear()
-    bridge.poll()
+    integration.poll()
     reads = [c for c in makia.calls if c[1].endswith("/progress")]
     assert len(reads) == 50
     # The next poll starts with the runs not read yet.
     makia.calls.clear()
-    bridge.poll()
+    integration.poll()
     again = {c[1] for c in makia.calls if c[1].endswith("/progress")}
     assert len(again) == 50 and sum(1 for p in again if p.startswith("/runs/bulk-")) >= 12
 
@@ -346,9 +347,9 @@ def inbound_calls(makia):
     return [c for c in makia.calls if c[1].startswith("/inbound/")]
 
 
-def test_folder_mode_posts_multipart_with_external_id_first(bridge, makia):
-    bridge.sync()
-    bridge.send()
+def test_folder_mode_posts_multipart_with_external_id_first(integration, makia):
+    integration.sync()
+    integration.send()
     first, second = makia.uploads
     assert first[0] == ("external_id", "", b"DOC-77812")
     assert first[1:] == [
@@ -359,47 +360,55 @@ def test_folder_mode_posts_multipart_with_external_id_first(bridge, makia):
         ("external_id", "", b"DOC-77813"),
         ("invoices", "invoice-3.pdf", b"%PDF-3"),
     ]
-    sent = rows(bridge.conn, "SELECT record_external_id, status FROM bridge_runs ORDER BY 1")
+    sent = rows(
+        integration.conn, "SELECT record_external_id, status FROM integration_runs ORDER BY 1"
+    )
     assert sent == [("DOC-77812", "sent"), ("DOC-77813", "sent")]
 
 
-def test_a_missing_file_skips_the_record_and_the_next_still_goes(bridge, makia, files_dir, caplog):
-    bridge.sync()
+def test_a_missing_file_skips_the_record_and_the_next_still_goes(
+    integration, makia, files_dir, caplog
+):
+    integration.sync()
     (files_dir / "2026" / "114" / "invoice-2.pdf").unlink()
-    bridge.send()
+    integration.send()
     assert len(makia.uploads) == 1 and makia.uploads[0][0][2] == b"DOC-77813"
-    assert rows(bridge.conn, "SELECT record_external_id FROM bridge_runs") == [("DOC-77813",)]
+    assert rows(integration.conn, "SELECT record_external_id FROM integration_runs") == [
+        ("DOC-77813",)
+    ]
     assert "DOC-77812" in caplog.text and "invoice-2.pdf" in caplog.text
 
 
-def test_a_file_over_the_cap_is_refused_without_a_request(bridge, makia, files_dir, monkeypatch):
-    from makia_bridge import jobs
+def test_a_file_over_the_cap_is_refused_without_a_request(
+    integration, makia, files_dir, monkeypatch
+):
+    from makia_integration import jobs
 
     monkeypatch.setattr(jobs, "MAX_FILE_BYTES", 6)
     (files_dir / "2026" / "114" / "invoice-3.pdf").write_bytes(b"%PDF-too-big")
-    bridge.sync()
-    bridge.send()
+    integration.sync()
+    integration.send()
     assert rows(
-        bridge.conn,
-        "SELECT record_external_id, status, error_code FROM bridge_runs ORDER BY 1",
+        integration.conn,
+        "SELECT record_external_id, status, error_code FROM integration_runs ORDER BY 1",
     ) == [("DOC-77812", "sent", None), ("DOC-77813", "refused", "file_too_large")]
     assert len(inbound_calls(makia)) == 1
 
 
-def test_a_413_file_too_large_answer_marks_the_record_refused(bridge, makia):
+def test_a_413_file_too_large_answer_marks_the_record_refused(integration, makia):
     makia.inbound_status, makia.inbound_code = 413, "file_too_large"
-    bridge.sync()
-    bridge.send()
-    assert rows(bridge.conn, "SELECT status, error_code FROM bridge_runs") == [
+    integration.sync()
+    integration.send()
+    assert rows(integration.conn, "SELECT status, error_code FROM integration_runs") == [
         ("refused", "file_too_large"),
         ("refused", "file_too_large"),
     ]
 
 
-def test_a_415_answer_marks_that_record_refused_and_the_next_still_goes(bridge, makia):
-    from makia_bridge.api import ApiError
+def test_a_415_answer_marks_that_record_refused_and_the_next_still_goes(integration, makia):
+    from makia_integration.api import ApiError
 
-    real = bridge.run_api.send_record_files
+    real = integration.run_api.send_record_files
     calls = []
 
     def flaky(*a, **kw):
@@ -408,17 +417,17 @@ def test_a_415_answer_marks_that_record_refused_and_the_next_still_goes(bridge, 
             raise ApiError(415, "unsupported_media_type")
         return real(*a, **kw)
 
-    bridge.run_api.send_record_files = flaky
-    bridge.sync()
-    bridge.send()
+    integration.run_api.send_record_files = flaky
+    integration.sync()
+    integration.send()
     assert rows(
-        bridge.conn,
-        "SELECT record_external_id, status, error_code FROM bridge_runs ORDER BY 1",
+        integration.conn,
+        "SELECT record_external_id, status, error_code FROM integration_runs ORDER BY 1",
     ) == [("DOC-77812", "refused", "unsupported_media_type"), ("DOC-77813", "sent", None)]
 
 
 def test_an_unreadable_file_skips_the_record_and_the_next_still_goes(
-    bridge, makia, files_dir, caplog
+    integration, makia, files_dir, caplog
 ):
     import os
 
@@ -427,46 +436,48 @@ def test_an_unreadable_file_skips_the_record_and_the_next_still_goes(
     try:
         if os.access(target, os.R_OK):
             pytest.skip("running as a user that ignores file modes")
-        bridge.sync()
-        bridge.send()
+        integration.sync()
+        integration.send()
     finally:
         target.chmod(0o644)
     assert len(makia.uploads) == 1 and makia.uploads[0][0][2] == b"DOC-77813"
-    assert rows(bridge.conn, "SELECT record_external_id FROM bridge_runs") == [("DOC-77813",)]
+    assert rows(integration.conn, "SELECT record_external_id FROM integration_runs") == [
+        ("DOC-77813",)
+    ]
     assert "DOC-77812" in caplog.text and "not readable" in caplog.text
 
 
-def test_an_empty_file_is_refused_without_a_request(bridge, makia, files_dir):
+def test_an_empty_file_is_refused_without_a_request(integration, makia, files_dir):
     (files_dir / "2026" / "114" / "invoice-3.pdf").write_bytes(b"")
-    bridge.sync()
-    bridge.send()
+    integration.sync()
+    integration.send()
     assert rows(
-        bridge.conn,
-        "SELECT record_external_id, status, error_code FROM bridge_runs ORDER BY 1",
+        integration.conn,
+        "SELECT record_external_id, status, error_code FROM integration_runs ORDER BY 1",
     ) == [("DOC-77812", "sent", None), ("DOC-77813", "refused", "empty_file")]
     assert len(inbound_calls(makia)) == 1
 
 
-def test_a_path_leaving_the_folder_is_never_read(bridge, makia, files_dir, tmp_path, caplog):
+def test_a_path_leaving_the_folder_is_never_read(integration, makia, files_dir, tmp_path, caplog):
     (tmp_path / "x.pdf").write_bytes(b"secret")
-    bridge.conn.execute(
+    integration.conn.execute(
         "UPDATE src_record_files SET path = '../x.pdf' WHERE path = '2026/114/invoice-3.pdf'"
     )
-    bridge.conn.execute(
+    integration.conn.execute(
         "INSERT INTO src_record_files (record_external_id, path) "
         f"VALUES ('DOC-77812', '{tmp_path}/x.pdf')"
     )
-    bridge.sync()
-    bridge.send()
+    integration.sync()
+    integration.send()
     assert makia.uploads == []
     assert b"secret" not in b"".join(p[2] for u in makia.uploads for p in u)
     assert "DOC-77813" in caplog.text
 
 
-def test_without_a_folder_the_body_is_json_by_reference(bridge, makia):
-    # the plain `bridge` fixture (files_dir None) is exercised by the tests above;
+def test_without_a_folder_the_body_is_json_by_reference(integration, makia):
+    # the plain `integration` fixture (files_dir None) is exercised by the tests above;
     # this one pins that no multipart is sent in that mode
-    bridge.files_dir = None
-    bridge.sync()
-    bridge.send()
+    integration.files_dir = None
+    integration.sync()
+    integration.send()
     assert makia.uploads == [] and len(makia.cases) == 2

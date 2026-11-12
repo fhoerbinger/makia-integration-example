@@ -1,4 +1,4 @@
-"""A tiny in-memory stand-in for MAKIA's API, enough to drive the bridge in
+"""A tiny in-memory stand-in for MAKIA's API, enough to drive the integration in
 tests. Its answers follow the shapes in MAKIA's openapi.json."""
 
 from __future__ import annotations

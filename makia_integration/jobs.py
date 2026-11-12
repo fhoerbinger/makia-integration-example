@@ -1,4 +1,4 @@
-"""The bridge's three jobs: sync, send, poll. Each is safe to run again."""
+"""The integration's three jobs: sync, send, poll. Each is safe to run again."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Any
 from .api import ApiError, MakiaClient
 from .db import Connection, execute, get_state, rows, set_state, upsert
 
-log = logging.getLogger("makia_bridge")
+log = logging.getLogger("makia_integration")
 
 # What the run account may do in every synced project.
 RUN_ACCOUNT_PERMISSIONS = ["cases", "run", "review"]
@@ -39,7 +39,7 @@ FINAL_STATUSES = frozenset(FINAL_RUN_EVENTS.values())
 
 
 @dataclass
-class Bridge:
+class Integration:
     conn: Connection
     sync_api: MakiaClient  # holds the sync token: /sync/* only
     run_api: MakiaClient  # holds the run account's token: everything else
@@ -107,7 +107,7 @@ class Bridge:
         pending = rows(
             self.conn,
             "SELECT r.external_id, r.project_external_id, r.workflow_slug, r.input_id FROM src_records r "
-            "WHERE NOT EXISTS (SELECT 1 FROM bridge_runs b WHERE b.record_external_id = r.external_id) "
+            "WHERE NOT EXISTS (SELECT 1 FROM integration_runs b WHERE b.record_external_id = r.external_id) "
             "ORDER BY r.external_id",
         )
         for external_id, project, workflow, input_id in pending:
@@ -144,7 +144,7 @@ class Bridge:
                 if err.code in REFUSALS:
                     upsert(
                         self.conn,
-                        "bridge_runs",
+                        "integration_runs",
                         {"record_external_id": external_id},
                         {"status": "refused", "error_code": err.code},
                     )
@@ -154,7 +154,7 @@ class Bridge:
                 raise
             upsert(
                 self.conn,
-                "bridge_runs",
+                "integration_runs",
                 {"record_external_id": external_id},
                 {
                     "case_id": answer["case_id"],
@@ -198,7 +198,7 @@ class Bridge:
             if code:
                 upsert(
                     self.conn,
-                    "bridge_runs",
+                    "integration_runs",
                     {"record_external_id": external_id},
                     {"status": "refused", "error_code": code},
                 )
@@ -235,7 +235,7 @@ class Bridge:
                 return
 
     def _start_feed(self) -> bool:
-        """A new bridge starts at the feed's head instead of replaying history.
+        """A new integration starts at the feed's head instead of replaying history.
         `send` calls this before its first run, so a run that ends before the
         first poll is still after the marker. True if the marker was just set."""
         if get_state(self.conn, "feed_marker") is not None:
@@ -247,12 +247,12 @@ class Bridge:
     def _read_progress(self, *, at_most: int = PROGRESS_READS_PER_POLL) -> None:
         """Store the live progress of runs `sent` or `running`, least recently
         read first (never-read first). A run that is running becomes `running`.
-        A run progress shows finished is one whose final event this bridge will
+        A run progress shows finished is one whose final event this integration will
         never read (it ended before the marker): it is caught up from here. The
         UPDATEs touch only open runs, so progress never moves a finished run back."""
         open_runs = rows(
             self.conn,
-            "SELECT run_id FROM bridge_runs WHERE status IN ('sent', 'running') "
+            "SELECT run_id FROM integration_runs WHERE status IN ('sent', 'running') "
             "AND run_id IS NOT NULL ORDER BY progress_at, record_external_id",
         )
         for (run_id,) in open_runs[:at_most]:
@@ -264,7 +264,7 @@ class Bridge:
                 # instead of filling the window every poll.
                 execute(
                     self.conn,
-                    "UPDATE bridge_runs SET progress_at = ? WHERE run_id = ?",
+                    "UPDATE integration_runs SET progress_at = ? WHERE run_id = ?",
                     datetime.now(UTC).isoformat(timespec="seconds"),
                     run_id,
                 )
@@ -272,7 +272,7 @@ class Bridge:
                 continue
             execute(
                 self.conn,
-                "UPDATE bridge_runs SET progress_json = ?, progress_at = ?, "
+                "UPDATE integration_runs SET progress_json = ?, progress_at = ?, "
                 "status = CASE WHEN ? = 'running' THEN 'running' ELSE status END "
                 "WHERE run_id = ? AND status IN ('sent', 'running')",
                 json.dumps(snapshot, sort_keys=True),
@@ -290,7 +290,7 @@ class Bridge:
         feed read and now), they set the same status and re-read the same rows."""
         execute(
             self.conn,
-            "UPDATE bridge_runs SET status = ? WHERE run_id = ? AND status IN ('sent', 'running')",
+            "UPDATE integration_runs SET status = ? WHERE run_id = ? AND status IN ('sent', 'running')",
             status,
             run_id,
         )
@@ -306,7 +306,7 @@ class Bridge:
         if kind in FINAL_RUN_EVENTS:
             execute(
                 self.conn,
-                "UPDATE bridge_runs SET status = ?, error_code = ? WHERE run_id = ?",
+                "UPDATE integration_runs SET status = ?, error_code = ? WHERE run_id = ?",
                 FINAL_RUN_EVENTS[kind],
                 ref.get("error_code"),
                 ref["run_id"],
@@ -322,18 +322,18 @@ class Bridge:
                 (run_id, view)
                 for run_id, view in rows(
                     self.conn,
-                    "SELECT DISTINCT r.run_id, r.view_key FROM bridge_results r "
-                    "JOIN bridge_runs b ON b.run_id = r.run_id WHERE b.case_id = ?",
+                    "SELECT DISTINCT r.run_id, r.view_key FROM integration_results r "
+                    "JOIN integration_runs b ON b.run_id = r.run_id WHERE b.case_id = ?",
                     ref["case_id"],
                 )
             }
         return set()
 
     def _is_ours(self, run_id: str) -> bool:
-        return bool(rows(self.conn, "SELECT 1 FROM bridge_runs WHERE run_id = ?", run_id))
+        return bool(rows(self.conn, "SELECT 1 FROM integration_runs WHERE run_id = ?", run_id))
 
     def read_results(self, run_id: str, view: str) -> None:
-        """Copy one view of a run into bridge_results, keyed by (run, view,
+        """Copy one view of a run into integration_results, keyed by (run, view,
         unit_key). A view rebuilt while reading answers 409
         generation_changed: start again from the top."""
         for _attempt in range(3):
@@ -358,7 +358,7 @@ class Bridge:
                 review = row["review"]
                 upsert(
                     self.conn,
-                    "bridge_results",
+                    "integration_results",
                     {"run_id": run_id, "view_key": view, "unit_key": row["unit_key"]},
                     {
                         "generation": generation,
@@ -377,7 +377,7 @@ class Bridge:
                 # Rows an older build had and this one does not are gone.
                 execute(
                     self.conn,
-                    "DELETE FROM bridge_results WHERE run_id = ? AND view_key = ? AND generation <> ?",
+                    "DELETE FROM integration_results WHERE run_id = ? AND view_key = ? AND generation <> ?",
                     run_id,
                     view,
                     generation,

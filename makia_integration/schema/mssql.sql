@@ -1,4 +1,4 @@
--- The customer's side. In a real bridge these are views over the source system.
+-- The customer's side. In a real integration these are views over the source system.
 IF OBJECT_ID('src_projects') IS NULL CREATE TABLE src_projects (
   external_id NVARCHAR(200) PRIMARY KEY,
   name        NVARCHAR(200) NOT NULL,
@@ -22,12 +22,12 @@ IF OBJECT_ID('src_record_files') IS NULL CREATE TABLE src_record_files (
   PRIMARY KEY (record_external_id, path)
 );
 
--- The bridge's own tables.
-IF OBJECT_ID('bridge_state') IS NULL CREATE TABLE bridge_state (
+-- The integration's own tables.
+IF OBJECT_ID('integration_state') IS NULL CREATE TABLE integration_state (
   name  NVARCHAR(100) PRIMARY KEY,
   value NVARCHAR(400) NOT NULL
 );
-IF OBJECT_ID('bridge_runs') IS NULL CREATE TABLE bridge_runs (
+IF OBJECT_ID('integration_runs') IS NULL CREATE TABLE integration_runs (
   record_external_id NVARCHAR(255) PRIMARY KEY,
   case_id            UNIQUEIDENTIFIER NULL,
   run_id             UNIQUEIDENTIFIER NULL,
@@ -37,7 +37,7 @@ IF OBJECT_ID('bridge_runs') IS NULL CREATE TABLE bridge_runs (
   progress_json      NVARCHAR(MAX) NULL,   -- last GET /runs/{id}/progress answer
   progress_at        NVARCHAR(40) NULL     -- when it was read
 );
-IF OBJECT_ID('bridge_results') IS NULL CREATE TABLE bridge_results (
+IF OBJECT_ID('integration_results') IS NULL CREATE TABLE integration_results (
   run_id         UNIQUEIDENTIFIER NOT NULL,
   view_key       NVARCHAR(100) NOT NULL,
   unit_key       NVARCHAR(300) NOT NULL,   -- key under 900 bytes

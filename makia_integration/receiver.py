@@ -18,7 +18,7 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-log = logging.getLogger("makia_bridge")
+log = logging.getLogger("makia_integration")
 
 MAX_AGE_S = 300  # a timestamp older than five minutes is refused (replay)
 MAX_BODY = 1_000_000
@@ -107,10 +107,10 @@ def make_server(coalescer: PollCoalescer, secret: str, port: int) -> ThreadingHT
     return ThreadingHTTPServer(("0.0.0.0", port), Handler)
 
 
-def serve(bridge: Any, secret: str, port: int) -> None:
+def serve(integration: Any, secret: str, port: int) -> None:
     """Listen until interrupted. Polls once at start (deliveries missed while
     the receiver was down are in the feed)."""
-    coalescer = PollCoalescer(bridge.poll)
+    coalescer = PollCoalescer(integration.poll)
     coalescer.kick()
     server = make_server(coalescer, secret, port)
     log.info("listening on :%d", server.server_port)
