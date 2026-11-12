@@ -1,5 +1,5 @@
 [project]
-name = "makia-bridge-example"
+name = "makia-integration-example"
 version = "0.1.0"
 description = "A small, readable example of a bridge between a customer database and MAKIA."
 readme = "README.md"
