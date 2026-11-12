@@ -105,6 +105,17 @@ def test_first_poll_starts_at_the_head(bridge, makia):
     assert get_state(bridge.conn, "feed_marker") == "1"
 
 
+def test_a_run_finished_before_the_first_poll_is_not_missed(bridge, makia):
+    makia.emit("run.succeeded", run_id="old", status="succeeded")
+    bridge.sync()
+    bridge.send()  # a new bridge stores the head before its first send
+    makia.emit("run.failed", run_id="run-1", status="failed", error_code=None)
+    bridge.poll()
+    assert rows(bridge.conn, "SELECT status FROM bridge_runs WHERE run_id = 'run-1'") == [
+        ("failed",)
+    ]
+
+
 def started(bridge, makia):
     bridge.sync()
     bridge.send()
@@ -234,6 +245,43 @@ def test_progress_marks_a_sent_run_running(bridge, makia):
     assert status_of(bridge, "run-2")[0] == "sent"
 
 
+def recovered(bridge, makia, status):
+    """DOC-77812's case: the run ended before this bridge's marker (a bridge
+    whose database was lost sends the record again and gets the known run), so
+    the feed never brings its outcome."""
+    makia.cases["DOC-77812"] = {
+        "case_id": "case-1",
+        "run_id": "run-1",
+        "status_url": "/runs/run-1",
+        "review_url": "https://studio.example/runs/run-1",
+    }
+    makia.emit("run.succeeded", run_id="run-1", status=status)  # before the marker
+    bridge.sync()
+    bridge.send()  # 200: the known case and its run
+    makia.progress["run-1"] = progress("run-1", status)
+
+
+def test_a_known_run_that_already_succeeded_is_caught_up(bridge, makia):
+    makia.set_rows("run-1", "mapping", [row("a"), row("b")])
+    recovered(bridge, makia, "succeeded")
+    bridge.poll()
+    assert rows(bridge.conn, "SELECT status FROM bridge_runs WHERE run_id = 'run-1'") == [
+        ("succeeded",)
+    ]
+    assert [r[0] for r in results(bridge)] == ["a", "b"]
+    bridge.poll()  # a finished run is not read again
+    assert makia.calls.count(("GET", "/runs/run-1/progress")) == 1
+
+
+def test_a_known_run_that_already_failed_is_caught_up(bridge, makia):
+    recovered(bridge, makia, "failed")
+    bridge.poll()
+    assert rows(bridge.conn, "SELECT status FROM bridge_runs WHERE run_id = 'run-1'") == [
+        ("failed",)
+    ]
+    assert ("GET", "/runs/run-1/views") not in makia.calls
+
+
 def test_final_status_not_overwritten_by_progress(bridge, makia):
     started(bridge, makia)
     makia.progress["run-1"] = progress("run-1", "running")
@@ -261,13 +309,6 @@ def test_failing_progress_reads_rotate_to_the_back(bridge, makia):
     started(bridge, makia)  # no snapshots in the fake: both reads 404
     bridge.poll()
     assert all(at for (at,) in rows(bridge.conn, "SELECT progress_at FROM bridge_runs"))
-
-
-def test_progress_of_a_finished_run_leaves_status_to_the_feed(bridge, makia):
-    started(bridge, makia)
-    makia.progress["run-1"] = progress("run-1", "succeeded")
-    bridge.poll()
-    assert status_of(bridge)[0] == "sent"
 
 
 def test_at_most_50_progress_reads_per_poll(bridge, makia):

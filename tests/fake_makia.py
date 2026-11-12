@@ -134,6 +134,21 @@ class FakeMakia:
             return httpx.Response(200, json=found) if found else _err(404, "run_not_found")
         if m := re.fullmatch(r"/runs/([^/]+)/results/([^/]+)", path):
             return self._results(m.group(1), m.group(2), req.url.params)
+        if m := re.fullmatch(r"/runs/([^/]+)/views", path):
+            built = sorted(v for r, v in self.results if r == m.group(1))
+            views = [
+                {"view": v, "title": None, "built": True, "backing": "rows", "builtAt": "t1"}
+                for v in built
+            ] + [
+                {
+                    "view": "declared-only",
+                    "title": None,
+                    "built": False,
+                    "backing": None,
+                    "builtAt": None,
+                }
+            ]
+            return httpx.Response(200, json={"views": views})
         return _err(404, "not_found")
 
     def _webhooks(self, req: httpx.Request) -> httpx.Response:

@@ -45,7 +45,7 @@ class FakeBridge:
         self.polls += 1
         self.started.set()
         if self.gate is not None and self.polls == 1:
-            self.gate.wait(5)
+            self.gate.wait(30)  # held until the test opens it, also on a slow machine
 
 
 def post(port: int, body: bytes, *, signature: str | None = None, ts: str | None = None) -> int:
@@ -107,7 +107,7 @@ def test_three_deliveries_during_a_poll_run_one_more_poll():
         for _ in range(3):
             assert post(server.server_port, b"{}") == 204  # answered at once
         bridge.gate.set()
-        assert wait_for(lambda: bridge.polls == 2)
+        assert wait_for(lambda: bridge.polls >= 2), bridge.polls
         time.sleep(0.2)
         assert bridge.polls == 2
     finally:

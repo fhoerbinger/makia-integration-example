@@ -21,6 +21,7 @@ FINAL_RUN_EVENTS = {
     "run.failed": "failed",
     "run.cancelled": "cancelled",
 }
+FINAL_STATUSES = frozenset(FINAL_RUN_EVENTS.values())
 
 
 @dataclass
@@ -85,6 +86,7 @@ class Bridge:
         """Start a run for every record not sent yet. A record sent before but
         whose answer was lost is sent again: MAKIA answers 200 with the
         existing case and writes nothing."""
+        self._start_feed()
         pending = rows(
             self.conn,
             "SELECT r.external_id, r.project_external_id, r.workflow_slug, r.input_id FROM src_records r "
@@ -151,13 +153,9 @@ class Bridge:
 
     def _poll_feed(self, *, limit: int) -> None:
         """Results are re-read per (run, view) once per page, then the marker moves."""
-        marker = get_state(self.conn, "feed_marker")
-        if marker is None:
-            # A new bridge starts at the head instead of replaying history.
-            set_state(self.conn, "feed_marker", str(self.run_api.changes_head()))
-            self.conn.commit()
+        if self._start_feed():
             return
-        after = int(marker)
+        after = int(get_state(self.conn, "feed_marker"))
         while True:
             page = self.run_api.changes(after, limit=limit)
             to_read: set[tuple[str, str]] = set()
@@ -171,11 +169,22 @@ class Bridge:
             if not page["more"]:
                 return
 
+    def _start_feed(self) -> bool:
+        """A new bridge starts at the feed's head instead of replaying history.
+        `send` calls this before its first run, so a run that ends before the
+        first poll is still after the marker. True if the marker was just set."""
+        if get_state(self.conn, "feed_marker") is not None:
+            return False
+        set_state(self.conn, "feed_marker", str(self.run_api.changes_head()))
+        self.conn.commit()
+        return True
+
     def _read_progress(self, *, at_most: int = PROGRESS_READS_PER_POLL) -> None:
         """Store the live progress of runs `sent` or `running`, least recently
-        read first (never-read first). A run that is running becomes `running`;
-        a final status only ever comes from the feed, and the UPDATE touches
-        only open runs, so progress never moves a finished run back."""
+        read first (never-read first). A run that is running becomes `running`.
+        A run progress shows finished is one whose final event this bridge will
+        never read (it ended before the marker): it is caught up from here. The
+        UPDATEs touch only open runs, so progress never moves a finished run back."""
         open_runs = rows(
             self.conn,
             "SELECT run_id FROM bridge_runs WHERE status IN ('sent', 'running') "
@@ -207,6 +216,25 @@ class Bridge:
                 run_id,
             )
             self.conn.commit()
+            if snapshot["run"]["status"] in FINAL_STATUSES:
+                self._catch_up(run_id, snapshot["run"]["status"])
+
+    def _catch_up(self, run_id: str, status: str) -> None:
+        """Take a finished run's outcome from its progress and copy the views it
+        built. Should its feed events still come (it ended between this poll's
+        feed read and now), they set the same status and re-read the same rows."""
+        execute(
+            self.conn,
+            "UPDATE bridge_runs SET status = ? WHERE run_id = ? AND status IN ('sent', 'running')",
+            status,
+            run_id,
+        )
+        self.conn.commit()
+        log.info("caught up %s: %s, ended before the feed marker", run_id, status)
+        if status == "succeeded":
+            for view in self.run_api.run_views(run_id):
+                if view["built"]:
+                    self.read_results(run_id, view["view"])
 
     def _handle(self, change: dict[str, Any]) -> set[tuple[str, str]]:
         kind, ref = change["type"], change["ref"]

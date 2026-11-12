@@ -23,6 +23,7 @@ ROUTES_USED: tuple[tuple[str, str], ...] = (
     ("GET", "/changes"),
     ("GET", "/runs/{id}/results/{view}"),
     ("GET", "/runs/{id}/progress"),
+    ("GET", "/runs/{id}/views"),
     ("POST", "/webhooks"),
     ("GET", "/webhooks"),
     ("PATCH", "/webhooks/{id}"),
@@ -156,6 +157,10 @@ class MakiaClient:
     def run_progress(self, run_id: str) -> dict[str, Any]:
         """The live snapshot of a run: items done per running node. No total."""
         return self._json("GET", f"/runs/{run_id}/progress")
+
+    def run_views(self, run_id: str) -> list[dict[str, Any]]:
+        """The views of a run; `built` is false for one not produced (yet)."""
+        return self._json("GET", f"/runs/{run_id}/views")["views"]
 
     def results_page(
         self, run_id: str, view: str, *, after: str | None = None, limit: int = 500

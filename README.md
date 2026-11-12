@@ -12,7 +12,7 @@ It is an example to read and copy, not a product. About 600 lines of Python, one
 |---|---|---|
 | `bridge sync` | Sends every project's full state (name, archived, members). Adds the run account to each. | `PUT /sync/projects/{id}` |
 | `bridge send` | Starts a run for every record not sent yet, with its files by reference. | `POST /inbound/projects/{id}/workflows/{slug}/runs` |
-| `bridge poll` | Reads the change feed from its marker, updates run status, copies results after `run.views_built`, re-reads them after a review. | `GET /changes`, `GET /runs/{id}/results/{view}` |
+| `bridge poll` | Reads the change feed from its marker, updates run status, copies results after `run.views_built`, re-reads them after a review. | `GET /changes`, `GET /runs/{id}/results/{view}`, `GET /runs/{id}/progress`, `GET /runs/{id}/views` |
 | `bridge listen --port 8080` | Receives MAKIA webhooks and polls on each one (see below). | |
 | `bridge webhook create --name N --connection <uuid> --path /hook [--project ID]… [--workflow ID]… [--blueprint ID]… [--type T]…` | Creates a webhook with the run token; prints its id and the signing secret once. | `POST /webhooks` |
 | `bridge webhook list` | Id, name, enabled, switched_off_reason, filters and last_seq of each webhook. | `GET /webhooks` |
@@ -24,7 +24,10 @@ It is an example to read and copy, not a product. About 600 lines of Python, one
 
 `bridge poll` also reads `GET /runs/{id}/progress` for runs still `sent` or `running` (at most 50 per poll),
 sets the status `running` and stores the answer in `bridge_runs.progress_json` / `progress_at`. The answer has item
-counts per running node and a `stale` flag, but no total or percentage. A final status only ever comes from the feed.
+counts per running node and a `stale` flag, but no total or percentage. A final status normally comes from the feed.
+A run that progress already shows finished ended before the bridge's feed marker, so its events will never be read
+(for example a record sent again after the bridge lost its database, answered with its known run). The bridge then
+takes the status from progress and copies every built view (`GET /runs/{id}/views`).
 
 Every step is safe to repeat. The bridge keys everything by the customer's own ids (`external_id`) and never
 deletes anything in MAKIA.
@@ -74,13 +77,19 @@ bridge answers `204` at once and polls. The delivery body is never trusted for c
 truth, so a repeated, late or reordered delivery only costs a poll that finds nothing new. Deliveries arriving
 during a poll are merged into exactly one more poll after it.
 
-1. Create the webhook with the **run account's** token (`MAKIA_RUN_TOKEN`):
+1. An organization admin adds the address MAKIA delivers to, once: Organization settings → External services →
+   Add external service, with the base URL where `bridge listen` is reachable (for example
+   `https://bridge.example.com`) and that host in its allowed hosts. MAKIA posts to the base URL plus the
+   webhook's `--path`, with the service's auth header (for a proxy in front to check; `bridge listen` itself
+   checks the signature, step 4). Note its id.
+2. Create the webhook with the **run account's** token (`MAKIA_RUN_TOKEN`):
    `bridge webhook create --name bridge --connection <connection-uuid> --path /hook [--type run.views_built]`.
-   It prints the webhook id and the signing secret once. `--connection` is an organization connection that
-   points at where `bridge listen` is reachable; `--project`, `--workflow`, `--blueprint` and `--type` (each
-   repeatable) narrow what it sends. Manage it later with `bridge webhook list|enable|disable|rotate-secret|delete|deliveries`.
-2. `export MAKIA_WEBHOOK_SECRET=…` and run `bridge listen --port 8080`. Run `bridge send` on its own schedule.
-3. `bridge listen` binds `0.0.0.0` and speaks plain HTTP: put it behind a TLS-terminating proxy. Every request is checked: `X-Makia-Signature` is `sha256=` plus the hex HMAC-SHA256 of `<X-Makia-Timestamp>.<body>`
+   It prints the webhook id and the signing secret once. `--project`, `--workflow`, `--blueprint` and `--type`
+   (each repeatable) narrow what it sends; without them it sends every change the run account may see. Run events
+   come once the run has ended. Manage it later with `bridge webhook list|enable|disable|rotate-secret|delete|deliveries`;
+   `deliveries` shows each attempt and the answer code.
+3. `export MAKIA_WEBHOOK_SECRET=…` and run `bridge listen --port 8080`. Run `bridge send` on its own schedule.
+4. `bridge listen` binds `0.0.0.0` and speaks plain HTTP: put it behind a TLS-terminating proxy. Every request is checked: `X-Makia-Signature` is `sha256=` plus the hex HMAC-SHA256 of `<X-Makia-Timestamp>.<body>`
    under the secret; timestamps older than five minutes are refused (`makia_bridge/receiver.py`).
 
 ## Run it
@@ -97,8 +106,8 @@ export BRIDGE_DB=bridge.db                 # a SQLite file
 bridge init-db
 sqlite3 bridge.db < sample/seed.sql        # invented sample data
 bridge sync
-bridge send
-bridge poll                                # the first poll only stores the feed's head
+bridge send                                # a new bridge first stores the feed's head
+bridge poll
 bridge run --interval 60                   # or keep it running
 ```
 
