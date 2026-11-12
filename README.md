@@ -64,11 +64,11 @@ Once, by an organization admin:
 
 1. Set up single sign-on (members are named by their SSO identity).
 2. Organization settings → Service accounts: add two accounts, a **sync account** and a **run account**. Mint a
-   token for each; for the sync account choose **Sync token**. Each secret is shown once.
+   token for each; for the sync account tick **Mint as sync token**. Each secret is shown once.
 3. Organization settings → Connector Connections: add the storage connection that holds the files. Note its id.
 4. Make sure the workflows the bridge starts exist in the projects under the slugs `src_records` names.
 
-The full guide is in Studio under Docs → Bridges.
+The full guide is in Studio under Docs → Integrations (`/docs/integration`).
 
 ## Webhooks instead of waiting
 
@@ -110,6 +110,23 @@ bridge send                                # a new bridge first stores the feed'
 bridge poll
 bridge run --interval 60                   # or keep it running
 ```
+
+### Files from a folder (SMB share, SFTP drop, local)
+
+Set `MAKIA_FILES_DIR` to the folder that holds the files, and the bridge uploads each record's files to MAKIA itself (multipart) instead of naming paths in a storage connection. `MAKIA_STORAGE_CONNECTION_ID` is then not needed. The paths in `src_record_files` are read relative to the folder. `sample/files` matches the sample data and works out of the box:
+
+```sh
+export MAKIA_FILES_DIR=sample/files
+```
+
+Mount a network share read-only. On Linux:
+
+```sh
+sudo mount -t cifs //server/share /mnt/belege -o credentials=/etc/makia-smb.cred,ro
+export MAKIA_FILES_DIR=/mnt/belege
+```
+
+On Windows use a UNC path (`\\server\share\belege`) or a mapped drive. A record with a missing file, or a path that leaves the folder, is skipped with a warning and sent on the next run once fixed. MAKIA takes up to 50 MB per file; a record with a bigger file is marked `refused` (`file_too_large`), as is one with an empty file (`empty_file`) or one MAKIA refuses (`unsupported_media_type`, `too_many_files`, `unknown_input`). An unreadable file (no permission) skips the record like a missing one. Send bigger files through a storage connection.
 
 On MS SQL, point `BRIDGE_DB` at an ODBC connection string:
 

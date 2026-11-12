@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 import time
 
 from .api import ApiError, MakiaClient
@@ -31,6 +32,9 @@ def _bridge() -> Bridge:
         sync_api=MakiaClient(url, _env("MAKIA_SYNC_TOKEN")),
         run_api=MakiaClient(url, _env("MAKIA_RUN_TOKEN")),
         storage_connection_id=os.environ.get("MAKIA_STORAGE_CONNECTION_ID", ""),
+        files_dir=Path(folder)
+        if (folder := os.environ.get("MAKIA_FILES_DIR", "").strip())
+        else None,
     )
 
 

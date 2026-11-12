@@ -6,6 +6,7 @@ import json
 import logging
 from datetime import UTC, datetime
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .api import ApiError, MakiaClient
@@ -21,6 +22,19 @@ FINAL_RUN_EVENTS = {
     "run.failed": "failed",
     "run.cancelled": "cancelled",
 }
+# MAKIA refuses a multipart file over 50 MB; check first so nothing half-goes.
+MAX_FILE_BYTES = 50 * 1024 * 1024
+REFUSALS = (
+    "project_archived",
+    "project_not_found",
+    "workflow_not_found",
+    "file_too_large",
+    # one record's files MAKIA will not take (multipart route)
+    "unsupported_media_type",
+    "empty_file",
+    "too_many_files",
+    "unknown_input",
+)
 FINAL_STATUSES = frozenset(FINAL_RUN_EVENTS.values())
 
 
@@ -30,6 +44,9 @@ class Bridge:
     sync_api: MakiaClient  # holds the sync token: /sync/* only
     run_api: MakiaClient  # holds the run account's token: everything else
     storage_connection_id: str
+    # Set: send each record's files from this folder as multipart. Unset: name
+    # the paths in the storage connection instead.
+    files_dir: Path | None = None
 
     # --- 1. sync projects and members ---------------------------------------
 
@@ -104,15 +121,27 @@ class Bridge:
             ]
             if not paths:
                 continue
-            sources = [
-                {"inputId": input_id, "connectionId": self.storage_connection_id, "paths": paths}
-            ]
             try:
-                status, answer = self.run_api.send_record(
-                    project, workflow, external_id=external_id, sources=sources
-                )
+                if self.files_dir is None:
+                    sources = [
+                        {
+                            "inputId": input_id,
+                            "connectionId": self.storage_connection_id,
+                            "paths": paths,
+                        }
+                    ]
+                    status, answer = self.run_api.send_record(
+                        project, workflow, external_id=external_id, sources=sources
+                    )
+                else:
+                    files = self._folder_files(external_id, input_id, paths)
+                    if files is None:
+                        continue
+                    status, answer = self.run_api.send_record_files(
+                        project, workflow, external_id=external_id, files=files
+                    )
             except ApiError as err:
-                if err.code in ("project_archived", "project_not_found", "workflow_not_found"):
+                if err.code in REFUSALS:
                     upsert(
                         self.conn,
                         "bridge_runs",
@@ -142,6 +171,42 @@ class Bridge:
                 "known" if status == 200 else "started",
                 answer["run_id"],
             )
+
+    def _folder_files(
+        self, external_id: str, input_id: str, paths: list[str]
+    ) -> list[tuple[str, Path]] | None:
+        """The record's files under `files_dir`, or None when the record must not
+        go: a file is missing or outside the folder (skipped, logged), or too big
+        (marked refused). Nothing is sent for a record that is not whole."""
+        assert self.files_dir is not None
+        root = self.files_dir.resolve()
+        found: list[tuple[str, Path]] = []
+        for rel in paths:
+            file = (root / rel).resolve()
+            if Path(rel).is_absolute() or not file.is_relative_to(root) or not file.is_file():
+                log.warning("send %s: skipped, file not found in the folder: %s", external_id, rel)
+                return None
+            try:
+                with file.open("rb"):
+                    size = file.stat().st_size
+            except OSError as err:
+                log.warning("send %s: skipped, file not readable: %s (%s)", external_id, rel, err)
+                return None
+            code = (
+                "file_too_large" if size > MAX_FILE_BYTES else "empty_file" if size == 0 else None
+            )
+            if code:
+                upsert(
+                    self.conn,
+                    "bridge_runs",
+                    {"record_external_id": external_id},
+                    {"status": "refused", "error_code": code},
+                )
+                self.conn.commit()
+                log.warning("send %s: refused (%s): %s", external_id, code, rel)
+                return None
+            found.append((input_id, file))
+        return found
 
     # --- 3. poll the change feed ----------------------------------------------
 

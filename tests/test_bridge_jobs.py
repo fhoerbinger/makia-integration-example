@@ -328,3 +328,145 @@ def test_at_most_50_progress_reads_per_poll(bridge, makia):
     bridge.poll()
     again = {c[1] for c in makia.calls if c[1].endswith("/progress")}
     assert len(again) == 50 and sum(1 for p in again if p.startswith("/runs/bulk-")) >= 12
+
+
+# --- send from a folder -------------------------------------------------------
+
+
+@pytest.fixture
+def files_dir(tmp_path):
+    folder = tmp_path / "belege"
+    (folder / "2026" / "114").mkdir(parents=True)
+    for n in (1, 2, 3):
+        (folder / "2026" / "114" / f"invoice-{n}.pdf").write_bytes(f"%PDF-{n}".encode())
+    return folder
+
+
+def inbound_calls(makia):
+    return [c for c in makia.calls if c[1].startswith("/inbound/")]
+
+
+def test_folder_mode_posts_multipart_with_external_id_first(bridge, makia):
+    bridge.sync()
+    bridge.send()
+    first, second = makia.uploads
+    assert first[0] == ("external_id", "", b"DOC-77812")
+    assert first[1:] == [
+        ("invoices", "invoice-1.pdf", b"%PDF-1"),
+        ("invoices", "invoice-2.pdf", b"%PDF-2"),
+    ]
+    assert second == [
+        ("external_id", "", b"DOC-77813"),
+        ("invoices", "invoice-3.pdf", b"%PDF-3"),
+    ]
+    sent = rows(bridge.conn, "SELECT record_external_id, status FROM bridge_runs ORDER BY 1")
+    assert sent == [("DOC-77812", "sent"), ("DOC-77813", "sent")]
+
+
+def test_a_missing_file_skips_the_record_and_the_next_still_goes(bridge, makia, files_dir, caplog):
+    bridge.sync()
+    (files_dir / "2026" / "114" / "invoice-2.pdf").unlink()
+    bridge.send()
+    assert len(makia.uploads) == 1 and makia.uploads[0][0][2] == b"DOC-77813"
+    assert rows(bridge.conn, "SELECT record_external_id FROM bridge_runs") == [("DOC-77813",)]
+    assert "DOC-77812" in caplog.text and "invoice-2.pdf" in caplog.text
+
+
+def test_a_file_over_the_cap_is_refused_without_a_request(bridge, makia, files_dir, monkeypatch):
+    from makia_bridge import jobs
+
+    monkeypatch.setattr(jobs, "MAX_FILE_BYTES", 6)
+    (files_dir / "2026" / "114" / "invoice-3.pdf").write_bytes(b"%PDF-too-big")
+    bridge.sync()
+    bridge.send()
+    assert rows(
+        bridge.conn,
+        "SELECT record_external_id, status, error_code FROM bridge_runs ORDER BY 1",
+    ) == [("DOC-77812", "sent", None), ("DOC-77813", "refused", "file_too_large")]
+    assert len(inbound_calls(makia)) == 1
+
+
+def test_a_413_file_too_large_answer_marks_the_record_refused(bridge, makia):
+    makia.inbound_status, makia.inbound_code = 413, "file_too_large"
+    bridge.sync()
+    bridge.send()
+    assert rows(bridge.conn, "SELECT status, error_code FROM bridge_runs") == [
+        ("refused", "file_too_large"),
+        ("refused", "file_too_large"),
+    ]
+
+
+def test_a_415_answer_marks_that_record_refused_and_the_next_still_goes(bridge, makia):
+    from makia_bridge.api import ApiError
+
+    real = bridge.run_api.send_record_files
+    calls = []
+
+    def flaky(*a, **kw):
+        calls.append(kw["external_id"])
+        if len(calls) == 1:
+            raise ApiError(415, "unsupported_media_type")
+        return real(*a, **kw)
+
+    bridge.run_api.send_record_files = flaky
+    bridge.sync()
+    bridge.send()
+    assert rows(
+        bridge.conn,
+        "SELECT record_external_id, status, error_code FROM bridge_runs ORDER BY 1",
+    ) == [("DOC-77812", "refused", "unsupported_media_type"), ("DOC-77813", "sent", None)]
+
+
+def test_an_unreadable_file_skips_the_record_and_the_next_still_goes(
+    bridge, makia, files_dir, caplog
+):
+    import os
+
+    target = files_dir / "2026" / "114" / "invoice-1.pdf"
+    target.chmod(0)
+    try:
+        if os.access(target, os.R_OK):
+            pytest.skip("running as a user that ignores file modes")
+        bridge.sync()
+        bridge.send()
+    finally:
+        target.chmod(0o644)
+    assert len(makia.uploads) == 1 and makia.uploads[0][0][2] == b"DOC-77813"
+    assert rows(bridge.conn, "SELECT record_external_id FROM bridge_runs") == [("DOC-77813",)]
+    assert "DOC-77812" in caplog.text and "not readable" in caplog.text
+
+
+def test_an_empty_file_is_refused_without_a_request(bridge, makia, files_dir):
+    (files_dir / "2026" / "114" / "invoice-3.pdf").write_bytes(b"")
+    bridge.sync()
+    bridge.send()
+    assert rows(
+        bridge.conn,
+        "SELECT record_external_id, status, error_code FROM bridge_runs ORDER BY 1",
+    ) == [("DOC-77812", "sent", None), ("DOC-77813", "refused", "empty_file")]
+    assert len(inbound_calls(makia)) == 1
+
+
+def test_a_path_leaving_the_folder_is_never_read(bridge, makia, files_dir, tmp_path, caplog):
+    (tmp_path / "x.pdf").write_bytes(b"secret")
+    bridge.conn.execute(
+        "UPDATE src_record_files SET path = '../x.pdf' WHERE path = '2026/114/invoice-3.pdf'"
+    )
+    bridge.conn.execute(
+        "INSERT INTO src_record_files (record_external_id, path) "
+        f"VALUES ('DOC-77812', '{tmp_path}/x.pdf')"
+    )
+    bridge.sync()
+    bridge.send()
+    assert makia.uploads == []
+    assert b"secret" not in b"".join(p[2] for u in makia.uploads for p in u)
+    assert "DOC-77813" in caplog.text
+
+
+def test_without_a_folder_the_body_is_json_by_reference(bridge, makia):
+    # the plain `bridge` fixture (files_dir None) is exercised by the tests above;
+    # this one pins that no multipart is sent in that mode
+    bridge.files_dir = None
+    bridge.sync()
+    bridge.send()
+    assert makia.uploads == [] and len(makia.cases) == 2

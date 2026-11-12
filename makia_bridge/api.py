@@ -6,8 +6,11 @@ against MAKIA's published API description (openapi.json).
 
 from __future__ import annotations
 
+import mimetypes
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -53,6 +56,10 @@ def _error(resp: httpx.Response) -> ApiError:
         body = resp.text
     code = body.get("error", "") if isinstance(body, dict) else ""
     return ApiError(resp.status_code, code or "unknown", body)
+
+
+def _content_type(file: Path) -> str:
+    return mimetypes.guess_type(file.name)[0] or "application/octet-stream"
 
 
 class MakiaClient:
@@ -144,6 +151,35 @@ class MakiaClient:
         body = {"external_id": external_id, "sources": sources}
         # Inbound takes the secret itself, not an access token.
         resp = self._http.post(path, json=body, headers={"Authorization": f"Bearer {self._secret}"})
+        if resp.status_code not in (200, 202):
+            raise _error(resp)
+        return resp.status_code, resp.json()
+
+    def send_record_files(
+        self,
+        project_external_id: str,
+        workflow_slug: str,
+        *,
+        external_id: str,
+        files: list[tuple[str, Path]],
+    ) -> tuple[int, dict[str, Any]]:
+        """Start a run over files uploaded as multipart: `external_id` first, then
+        one part per file named by its input id. Answers as `send_record` does."""
+        path = (
+            f"/inbound/projects/{quote(project_external_id, safe='')}"
+            f"/workflows/{quote(workflow_slug, safe='')}/runs"
+        )
+        with ExitStack() as stack:
+            parts = [
+                (input_id, (file.name, stack.enter_context(file.open("rb")), _content_type(file)))
+                for input_id, file in files
+            ]
+            resp = self._http.post(
+                path,
+                data={"external_id": external_id},
+                files=parts,
+                headers={"Authorization": f"Bearer {self._secret}"},
+            )
         if resp.status_code not in (200, 202):
             raise _error(resp)
         return resp.status_code, resp.json()

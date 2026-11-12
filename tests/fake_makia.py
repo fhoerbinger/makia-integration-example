@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import re
+from email.parser import BytesParser
+from email.policy import HTTP
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,6 +31,11 @@ class FakeMakia:
     deliveries: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     delivery_limits: list[str | None] = field(default_factory=list)
     calls: list[tuple[str, str]] = field(default_factory=list)
+    uploads: list[list[tuple[str, str, bytes]]] = field(
+        default_factory=list
+    )  # multipart parts per request: (field, filename, bytes)
+    inbound_status: int | None = None  # answer every inbound call with this error status
+    inbound_code: str = ""
     swaps: int = 0
     expire_next: bool = False  # answer the next authenticated call 401 once
     rebuild_once: set[tuple[str, str]] = field(
@@ -219,7 +226,25 @@ class FakeMakia:
         project = req.url.path.split("/")[3]
         if self.projects.get(project, {}).get("archived"):
             return _err(409, "project_archived")
-        body = json.loads(req.content)
+        if self.inbound_status:
+            return _err(self.inbound_status, self.inbound_code)
+        ctype = req.headers.get("content-type", "")
+        if ctype.startswith("multipart/form-data"):
+            msg = BytesParser(policy=HTTP).parsebytes(
+                b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + req.content
+            )
+            parts = [
+                (
+                    p.get_param("name", header="content-disposition"),
+                    p.get_filename() or "",
+                    p.get_payload(decode=True),
+                )
+                for p in msg.iter_parts()
+            ]
+            self.uploads.append(parts)
+            body = {"external_id": parts[0][2].decode()}
+        else:
+            body = json.loads(req.content)
         known = self.cases.get(body["external_id"])
         if known:
             return httpx.Response(200, json=known)

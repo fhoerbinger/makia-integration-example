@@ -16,12 +16,18 @@ from makia_bridge.jobs import Bridge  # noqa: E402
 
 
 @pytest.fixture
+def files_dir() -> Path | None:
+    """None = send by reference. Tests of the folder mode override this."""
+    return None
+
+
+@pytest.fixture
 def makia() -> FakeMakia:
     return FakeMakia()
 
 
 @pytest.fixture
-def bridge(makia: FakeMakia) -> Bridge:
+def bridge(makia: FakeMakia, files_dir: Path | None) -> Bridge:
     conn = sqlite3.connect(":memory:")
     create_schema(conn, "sqlite")
     conn.executescript((HERE.parent / "sample" / "seed.sql").read_text())
@@ -31,4 +37,5 @@ def bridge(makia: FakeMakia) -> Bridge:
         sync_api=MakiaClient(url, SYNC_SECRET, transport=makia.transport()),
         run_api=MakiaClient(url, RUN_SECRET, transport=makia.transport()),
         storage_connection_id="conn-1",
+        files_dir=files_dir,
     )
