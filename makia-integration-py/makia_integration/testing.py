@@ -41,6 +41,8 @@ class FakeMakia:
     rebuild_once: set[tuple[str, str]] = field(
         default_factory=set
     )  # 409 generation_changed on page 2 once
+    deleted_runs: set[str] = field(default_factory=set)  # 404 run_not_found everywhere
+    deleted_views: set[tuple[str, str]] = field(default_factory=set)  # 404 view_not_found
     _tokens: dict[str, str] = field(default_factory=dict)  # access token -> secret
 
     # --- helpers for tests --------------------------------------------------
@@ -63,6 +65,29 @@ class FakeMakia:
         self, run_id: str, view: str, rows: list[dict[str, Any]], generation: str = "g1"
     ) -> None:
         self.results[(run_id, view)] = {"generation": generation, "rows": rows}
+
+    def delete_run(self, run_id: str) -> None:
+        """The run is gone (deleted in Studio): its routes answer 404 run_not_found, and
+        an inbound call for its record answers 200 with `run_id` null."""
+        self.deleted_runs.add(run_id)
+        self.progress.pop(run_id, None)
+        for key in [k for k in self.results if k[0] == run_id]:
+            del self.results[key]
+        for answer in self.cases.values():
+            if answer.get("run_id") == run_id:
+                answer.update(run_id=None, status_url=None, review_url=None)
+
+    def delete_view(self, run_id: str, view: str) -> None:
+        """The view is no longer declared: reading it answers 404 view_not_found."""
+        self.deleted_views.add((run_id, view))
+        self.results.pop((run_id, view), None)
+
+    def _run_known(self, run_id: str) -> bool:
+        if run_id in self.deleted_runs:
+            return False
+        return run_id in self.progress or any(
+            a.get("run_id") == run_id for a in self.cases.values()
+        )
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self._handle)
@@ -137,11 +162,15 @@ class FakeMakia:
                 200, json={"changes": page, "next": nxt, "more": nxt < len(self.changes)}
             )
         if m := re.fullmatch(r"/runs/([^/]+)/progress", path):
-            found = self.progress.get(m.group(1))
-            return httpx.Response(200, json=found) if found else _err(404, "run_not_found")
+            if not self._run_known(m.group(1)):
+                return _err(404, "run_not_found")
+            # A run with no snapshot set is queued: nothing stored yet.
+            return httpx.Response(200, json=self.progress.get(m.group(1)) or _queued(m.group(1)))
         if m := re.fullmatch(r"/runs/([^/]+)/results/([^/]+)", path):
             return self._results(m.group(1), m.group(2), req.url.params)
         if m := re.fullmatch(r"/runs/([^/]+)/views", path):
+            if m.group(1) in self.deleted_runs:
+                return _err(404, "run_not_found")
             built = sorted(v for r, v in self.results if r == m.group(1))
             views = [
                 {"view": v, "title": None, "built": True, "backing": "rows", "builtAt": "t1"}
@@ -260,6 +289,10 @@ class FakeMakia:
         return httpx.Response(202, json=answer)
 
     def _results(self, run_id: str, view: str, params: httpx.QueryParams) -> httpx.Response:
+        if run_id in self.deleted_runs:
+            return _err(404, "run_not_found")
+        if (run_id, view) in self.deleted_views:
+            return _err(404, "view_not_found")
         stored = self.results.get((run_id, view))
         if stored is None:
             return _err(409, "views_not_built")
@@ -290,6 +323,18 @@ class FakeMakia:
 
 def _err(status: int, code: str) -> httpx.Response:
     return httpx.Response(status, json={"error": code})
+
+
+def _queued(run_id: str) -> dict[str, Any]:
+    return {
+        "run": {"id": run_id, "status": "queued", "started_at": None, "finished_at": None},
+        "updated_at": None,
+        "running": [],
+        "nodes_finished": None,
+        "findings": None,
+        "reports": None,
+        "stale": False,
+    }
 
 
 def row(

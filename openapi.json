@@ -35,9 +35,6 @@
     },
     {
       "name": "Integration"
-    },
-    {
-      "name": "Bridge"
     }
   ],
   "security": [
@@ -55,7 +52,7 @@
     },
     "responses": {
       "Error": {
-        "description": "Any error. Below 500: `{ error: <code>, detail? }`; 500: `{ error: \"internal_error\", requestId }`.",
+        "description": "Any error. Below 500: `{ error: <code>, detail? }`; 500: `{ error: \"internal_error\", requestId }`, or `{ error: \"storage_access_denied\", requestId }` when the document store refuses the service; 503: `{ error: \"storage_unavailable\", requestId }` when the store cannot issue credentials for now.",
         "content": {
           "application/json": {
             "schema": {
@@ -9844,7 +9841,7 @@
       "post": {
         "operationId": "postWebhooks",
         "tags": [
-          "Bridge"
+          "Integration"
         ],
         "summary": "Create a webhook",
         "description": "A service account's own webhook: the platform posts each matching change (the `GET /changes` types) to the organization's external connection plus `path`. It starts at the organization's current head: no history is replayed. The signing `secret` is answered once.",
@@ -10096,7 +10093,7 @@
       "get": {
         "operationId": "getWebhooks",
         "tags": [
-          "Bridge"
+          "Integration"
         ],
         "summary": "The caller's webhooks",
         "parameters": [],
@@ -10249,7 +10246,7 @@
       "patch": {
         "operationId": "patchWebhooksId",
         "tags": [
-          "Bridge"
+          "Integration"
         ],
         "summary": "Change a webhook",
         "description": "Switching one off keeps its place; switching it on resumes from there.",
@@ -10522,7 +10519,7 @@
       "delete": {
         "operationId": "deleteWebhooksId",
         "tags": [
-          "Bridge"
+          "Integration"
         ],
         "summary": "Delete a webhook",
         "parameters": [
@@ -10594,7 +10591,7 @@
       "post": {
         "operationId": "postWebhooksIdRotateSecret",
         "tags": [
-          "Bridge"
+          "Integration"
         ],
         "summary": "Replace the signing secret",
         "description": "The new secret is answered once; the old one stops signing at once.",
@@ -10683,7 +10680,7 @@
       "get": {
         "operationId": "getWebhooksIdDeliveries",
         "tags": [
-          "Bridge"
+          "Integration"
         ],
         "summary": "A webhook's newest deliveries",
         "parameters": [
@@ -10859,10 +10856,10 @@
       "get": {
         "operationId": "getRunsIdProgress",
         "tags": [
-          "Bridge"
+          "Integration"
         ],
         "summary": "How far a run has come",
-        "description": "The run's live progress as the worker last stored it (at most every 5 s, and once more when nothing runs any more), for a bridge to show a run that is still `sent` or `running`. There is no total and no percentage: cached, skipped and per-document nodes make a count from the graph misleading. `running` lists the nodes in flight; `items_done` / `item_count` are exact for a node that runs per item, null otherwise. A queued run (and a run with no stored progress) answers `updated_at: null`, `running: []` and null counts; a finished run its final status, the last snapshot's counts and `running: []`. The worker refreshes the snapshot at least every 10 s for as long as the run is `running`, so `stale` (the run is `running` and its snapshot, or with none its start, is older than 30 s) means no progress was written for 30 s: usually the worker is gone, sometimes only its live-progress connection (the run may still finish). Counts are the current attempt's: a resumed run counts from its resume. Any token that may read the run; not for a `sync`-scoped token.",
+        "description": "The run's live progress as the worker last stored it (at most every 5 s, and once more when nothing runs any more), for an integration to show a run that is still `sent` or `running`. There is no total and no percentage: cached, skipped and per-document nodes make a count from the graph misleading. `running` lists the nodes in flight; `items_done` / `item_count` are exact for a node that runs per item, null otherwise. A queued run (and a run with no stored progress) answers `updated_at: null`, `running: []` and null counts; a finished run its final status, the last snapshot's counts and `running: []`. The worker refreshes the snapshot at least every 10 s for as long as the run is `running`, so `stale` (the run is `running` and its snapshot, or with none its start, is older than 30 s) means no progress was written for 30 s: usually the worker is gone, sometimes only its live-progress connection (the run may still finish). Counts are the current attempt's: a resumed run counts from its resume. Any token that may read the run; not for a `sync`-scoped token.",
         "parameters": [
           {
             "name": "id",

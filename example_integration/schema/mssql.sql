@@ -22,20 +22,14 @@ IF OBJECT_ID('src_record_files') IS NULL CREATE TABLE src_record_files (
   PRIMARY KEY (record_external_id, path)
 );
 
--- The integration's own tables.
-IF OBJECT_ID('integration_state') IS NULL CREATE TABLE integration_state (
-  name  NVARCHAR(100) PRIMARY KEY,
-  value NVARCHAR(400) NOT NULL
-);
+-- The example's own result tables (the package keeps its state in its own file).
 IF OBJECT_ID('integration_runs') IS NULL CREATE TABLE integration_runs (
   record_external_id NVARCHAR(255) PRIMARY KEY,
   case_id            UNIQUEIDENTIFIER NULL,
   run_id             UNIQUEIDENTIFIER NULL,
   review_url         NVARCHAR(1000) NULL,
   status             NVARCHAR(20) NOT NULL,
-  error_code         NVARCHAR(100) NULL,
-  progress_json      NVARCHAR(MAX) NULL,   -- last GET /runs/{id}/progress answer
-  progress_at        NVARCHAR(40) NULL     -- when it was read
+  error_code         NVARCHAR(100) NULL
 );
 IF OBJECT_ID('integration_results') IS NULL CREATE TABLE integration_results (
   run_id         UNIQUEIDENTIFIER NOT NULL,

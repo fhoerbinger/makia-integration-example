@@ -22,20 +22,14 @@ CREATE TABLE IF NOT EXISTS src_record_files (
   PRIMARY KEY (record_external_id, path)
 );
 
--- The integration's own tables.
-CREATE TABLE IF NOT EXISTS integration_state (
-  name  TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
+-- The example's own result tables (the package keeps its state in its own file).
 CREATE TABLE IF NOT EXISTS integration_runs (
   record_external_id TEXT PRIMARY KEY,
   case_id            TEXT,
   run_id             TEXT,
   review_url         TEXT,
   status             TEXT NOT NULL,   -- sent | running | succeeded | failed | cancelled | refused
-  error_code         TEXT,
-  progress_json      TEXT,            -- last GET /runs/{id}/progress answer
-  progress_at        TEXT             -- when it was read
+  error_code         TEXT
 );
 CREATE TABLE IF NOT EXISTS integration_results (
   run_id         TEXT NOT NULL,

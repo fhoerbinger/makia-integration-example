@@ -17,6 +17,7 @@ SCHEMA_DIR = Path(__file__).parent / "schema"
 class Connection(Protocol):
     def cursor(self) -> Any: ...
     def commit(self) -> None: ...
+    def rollback(self) -> None: ...
     def close(self) -> None: ...
 
 
@@ -27,9 +28,8 @@ def connect(url: str) -> tuple[Connection, str]:
         import pyodbc  # optional dependency: pip install .[mssql]
 
         return pyodbc.connect(url.removeprefix("odbc:")), "mssql"
-    # `makia-integration listen` builds the connection on the main thread but polls on the
-    # coalescer's one worker thread. Only that thread touches it afterwards (polls
-    # never overlap), so sharing it across threads is safe.
+    # `makia-integration listen` builds the connection on the main thread but polls on another
+    # thread. Only that thread touches it afterwards (polls never overlap), so sharing is safe.
     return sqlite3.connect(url, check_same_thread=False), "sqlite"
 
 
@@ -71,12 +71,3 @@ def upsert(conn: Connection, table: str, key: dict[str, Any], values: dict[str, 
         *key.values(),
         *values.values(),
     )
-
-
-def get_state(conn: Connection, name: str) -> str | None:
-    found = rows(conn, "SELECT value FROM integration_state WHERE name = ?", name)
-    return found[0][0] if found else None
-
-
-def set_state(conn: Connection, name: str, value: str) -> None:
-    upsert(conn, "integration_state", {"name": name}, {"value": value})

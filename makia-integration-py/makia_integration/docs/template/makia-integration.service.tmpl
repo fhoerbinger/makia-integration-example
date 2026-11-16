@@ -1,0 +1,21 @@
+# integration.py, the venv and the working folder live in /opt/makia-integration (paths below).
+# Webhooks later: create the webhook, set MAKIA_WEBHOOK_SECRET in the env file, then add
+# `--listen 8080` after `run` in ExecStart (see the guide, "Running as a service").
+# Install: copy to /etc/systemd/system/makia-integration.service, edit User= and the paths,
+# then:  systemctl daemon-reload && systemctl enable --now makia-integration
+# Logs:  journalctl -u makia-integration   and   /var/log/makia-integration/integration.log
+[Unit]
+Description=MAKIA integration
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=makia-integration
+WorkingDirectory=/opt/makia-integration
+Environment=MAKIA_INTEGRATION=integration:integration
+ExecStart=/opt/makia-integration/venv/bin/makia-integration --env-file /etc/makia-integration.env --log-file /var/log/makia-integration/integration.log run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

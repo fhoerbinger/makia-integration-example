@@ -1,0 +1,311 @@
+"""A starter integration: reads projects, members and records from a database, writes
+results back into it.
+
+As shipped it runs against a small SQLite file with a few invented rows, and the
+test uses an in-memory copy, so `pytest` passes before you change anything. To make it yours:
+
+1. Replace `connect()` with a connection to your database.
+2. Replace each `# TODO` query with one against your own tables.
+3. Run `makia-integration doctor`.
+
+The package never creates tables in your database. The tables below exist only in
+the sample database; `DbSink` writes into `record_runs` and `record_results`,
+which you point at tables you own. `DbSink.close()` closes the connection; the
+package calls it through `Integration.close()`.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+from makia_integration import (
+    Integration,
+    Config,
+    Member,
+    Project,
+    Record,
+    ResultRow,
+    RunRef,
+    RunState,
+    SentRun,
+)
+
+log = logging.getLogger("integration")
+
+# The placeholder of your driver: "?" for sqlite3 and pyodbc, "%s" for pymssql.
+PARAM = "?"
+
+# --- the sample database (delete when `connect()` points at your database) ------
+
+SAMPLE_SCHEMA = """
+CREATE TABLE src_projects (external_id TEXT PRIMARY KEY, name TEXT, archived INTEGER);
+CREATE TABLE src_members (project_external_id TEXT, subject TEXT, permissions TEXT);
+CREATE TABLE src_records (
+    external_id TEXT PRIMARY KEY, project_external_id TEXT, workflow_slug TEXT, input_id TEXT
+);
+CREATE TABLE src_record_files (record_external_id TEXT, path TEXT);
+CREATE TABLE record_runs (
+    record_external_id TEXT PRIMARY KEY, case_id TEXT, run_id TEXT, review_url TEXT,
+    status TEXT, error_code TEXT, note TEXT
+);
+CREATE TABLE record_results (
+    run_id TEXT, view TEXT, unit_key TEXT, generation TEXT, row_key TEXT, data TEXT,
+    findings_open INTEGER, review_state TEXT, review_option TEXT, url TEXT,
+    PRIMARY KEY (run_id, view, unit_key)
+);
+"""
+
+SAMPLE_ROWS = """
+INSERT INTO src_projects VALUES ('2026-114', 'Engagement 2026-114', 0);
+INSERT INTO src_projects VALUES ('2025-087', 'Engagement 2025-087', 1);
+INSERT INTO src_members VALUES ('2026-114', 'uid=a.huber,ou=people', 'review,cases');
+INSERT INTO src_members VALUES ('2026-114', 'uid=m.berger,ou=people', 'review');
+INSERT INTO src_records VALUES ('DOC-77812', '2026-114', 'invoice-check', 'invoices');
+INSERT INTO src_records VALUES ('DOC-77813', '2026-114', 'invoice-check', 'invoices');
+INSERT INTO src_record_files VALUES ('DOC-77812', '2026/114/invoice-1.pdf');
+INSERT INTO src_record_files VALUES ('DOC-77812', '2026/114/invoice-2.pdf');
+INSERT INTO src_record_files VALUES ('DOC-77813', '2026/114/invoice-3.pdf');
+"""
+
+
+SAMPLE_DB = "sample-integration.db"
+
+
+def connect() -> Any:
+    """Return a DB-API connection.
+
+    As shipped this is a SQLite file, `sample-integration.db` in the working directory, filled
+    with the sample rows when it does not exist yet. Those rows are real to MAKIA: they are
+    sent to the MAKIA in your env file.
+
+    TODO: replace with your driver, for example
+        import pyodbc
+        return pyodbc.connect("DRIVER={ODBC Driver 18 for SQL Server};SERVER=...")
+    and set PARAM above to match it."""
+    log.warning("integration.py still uses the sample database: replace connect()")
+    fresh = not Path(SAMPLE_DB).exists()
+    db = sqlite3.connect(SAMPLE_DB)
+    if fresh:
+        db.executescript(SAMPLE_SCHEMA + SAMPLE_ROWS)
+        db.commit()
+    return db
+
+
+# --- Source: what to send ------------------------------------------------------------
+
+
+class DbSource:
+    def __init__(self, db: Any) -> None:
+        self.db = db
+
+    def _rows(self, sql: str, *args: Any) -> list[tuple[Any, ...]]:
+        cursor = self.db.cursor()
+        try:
+            cursor.execute(sql, args)
+            return [tuple(row) for row in cursor.fetchall()]
+        finally:
+            cursor.close()
+
+    def projects(self) -> list[Project]:
+        # TODO: your projects (engagements, clients). `archived` must be true for a
+        # project that is closed; a project that merely disappears is not archived.
+        rows = self._rows("SELECT external_id, name, archived FROM src_projects")
+        return [Project(external_id=r[0], name=r[1], archived=bool(r[2])) for r in rows]
+
+    def members(self) -> list[Member]:
+        # TODO: who may see each project. `subject` is the person's identity as MAKIA
+        # knows it (the login's subject). `permissions` is a comma list here.
+        rows = self._rows("SELECT project_external_id, subject, permissions FROM src_members")
+        return [
+            Member(
+                project_external_id=r[0],
+                subject=r[1],
+                permissions=tuple(p.strip() for p in r[2].split(",") if p.strip()),
+            )
+            for r in rows
+        ]
+
+    def records(self) -> list[Record]:
+        # TODO: the records to send. Returning every record every time is fine: the
+        # package skips those it already sent. `external_id` must never change.
+        rows = self._rows(
+            "SELECT external_id, project_external_id, workflow_slug, input_id FROM src_records"
+        )
+        return [Record(*r) for r in rows]
+
+    def files(self, record: Record) -> list[str]:
+        # TODO: the record's files. With MAKIA_STORAGE_CONNECTION_ID set these are paths
+        # in that storage connection; with MAKIA_FILES_DIR set they are paths below it.
+        rows = self._rows(
+            f"SELECT path FROM src_record_files WHERE record_external_id = {PARAM}",
+            record.external_id,
+        )
+        return [r[0] for r in rows]
+
+
+# --- Sink: where results go ----------------------------------------------------------
+#
+# The package calls the sink at least once per event, never lost, sometimes twice.
+# So every method must be safe to repeat: update first, insert if nothing was updated.
+
+
+class DbSink:
+    def __init__(self, db: Any) -> None:
+        self.db = db
+
+    def _write(self, sql: str, *args: Any) -> int:
+        cursor = self.db.cursor()
+        try:
+            cursor.execute(sql, args)
+            return int(cursor.rowcount)
+        except BaseException:
+            self.db.rollback()  # the package calls again; start from a clean connection
+            raise
+        finally:
+            cursor.close()
+
+    def close(self) -> None:
+        # Integration.close() calls this when the integration is done or is rebuilt after a failure.
+        self.db.close()
+
+    def _save_run(
+        self, record_external_id: str, on_insert: dict[str, Any] | None = None, **fields: Any
+    ) -> None:
+        # TODO: point this at the table where you keep one line per record.
+        # `on_insert` holds columns written only when the line is new.
+        names = list(fields)
+        assignments = ", ".join(f"{n} = {PARAM}" for n in names)
+        values = [fields[n] for n in names]
+        updated = self._write(
+            f"UPDATE record_runs SET {assignments} WHERE record_external_id = {PARAM}",
+            *values,
+            record_external_id,
+        )
+        if updated == 0:
+            extra = on_insert or {}
+            columns = ", ".join(["record_external_id", *names, *extra])
+            marks = ", ".join([PARAM] * (len(names) + len(extra) + 1))
+            self._write(
+                f"INSERT INTO record_runs ({columns}) VALUES ({marks})",
+                record_external_id,
+                *values,
+                *extra.values(),
+            )
+        self.db.commit()
+
+    def run_sent(self, record: Record, run: SentRun) -> None:
+        # May come again for the same run after its final status (at-least-once): the
+        # status goes back to "sent" only for a new run of the record, never for this one.
+        self._write(
+            f"UPDATE record_runs SET status = 'sent', error_code = NULL "
+            f"WHERE record_external_id = {PARAM} AND (run_id IS NULL OR run_id <> {PARAM})",
+            record.external_id,
+            run.run_id,
+        )
+        self._save_run(
+            record.external_id,
+            on_insert={"status": "sent"},
+            case_id=run.case_id,
+            run_id=run.run_id,
+            review_url=run.review_url,
+            note=None,
+        )
+
+    def run_refused(self, record: Record, code: str) -> None:
+        # A fixable code is reported again every pass until it is fixed; a final one
+        # once, until `makia-integration retry`. The codes: the guide's "Refusals".
+        self._save_run(record.external_id, status="refused", error_code=code)
+
+    def record_skipped(self, record: Record, reason: str) -> None:
+        # Not sent this pass (no files, a file missing); tried again next pass.
+        self._save_run(record.external_id, note=reason)
+
+    def run_status(self, state: RunState) -> None:
+        self._save_run(
+            state.ref.record_external_id, status=state.status, error_code=state.error_code
+        )
+
+    def result_rows(
+        self, ref: RunRef, view: str, generation: str, rows: list[ResultRow]
+    ) -> None:
+        # One page of a view. TODO: point this at your results table. The key is
+        # (run_id, view, unit_key); keep the generation, `view_done` needs it.
+        for row in rows:
+            fields = (
+                generation,
+                row.row_key,
+                json.dumps(row.data, ensure_ascii=False),
+                row.findings_open,
+                row.review_state,
+                row.review_option,
+                row.url,
+            )
+            updated = self._write(
+                "UPDATE record_results SET generation = {p}, row_key = {p}, data = {p}, "
+                "findings_open = {p}, review_state = {p}, review_option = {p}, url = {p} "
+                "WHERE run_id = {p} AND view = {p} AND unit_key = {p}".format(p=PARAM),
+                *fields,
+                ref.run_id,
+                view,
+                row.unit_key,
+            )
+            if updated == 0:
+                self._write(
+                    "INSERT INTO record_results (generation, row_key, data, findings_open, "
+                    "review_state, review_option, url, run_id, view, unit_key) "
+                    "VALUES ({})".format(", ".join([PARAM] * 10)),
+                    *fields,
+                    ref.run_id,
+                    view,
+                    row.unit_key,
+                )
+        self.db.commit()
+
+    def view_done(self, ref: RunRef, view: str, generation: str) -> None:
+        # All pages of this generation are in: rows of any other generation are gone
+        # from the view (a rebuild), so delete them.
+        self._write(
+            f"DELETE FROM record_results WHERE run_id = {PARAM} AND view = {PARAM} "
+            f"AND generation <> {PARAM}",
+            ref.run_id,
+            view,
+            generation,
+        )
+        self.db.commit()
+
+
+# --- The factory the command loads (MAKIA_INTEGRATION=integration:integration) ------------------------
+
+
+def integration(config: Config) -> Integration:
+    sync_api, run_api = config.clients()
+    try:
+        state = config.open_state()
+    except BaseException:
+        sync_api.close()
+        run_api.close()
+        raise
+    db = None
+    try:
+        db = connect()
+        return Integration(
+            DbSource(db),
+            DbSink(db),
+            sync_api=sync_api,
+            run_api=run_api,
+            state=state,
+            storage_connection_id=config.storage_connection_id,
+            files_dir=config.files_dir,
+            run_account_permissions=config.run_account_permissions,
+        )
+    except BaseException:
+        if db is not None:
+            db.close()
+        state.close()  # or the next attempt finds the state file locked
+        sync_api.close()
+        run_api.close()
+        raise

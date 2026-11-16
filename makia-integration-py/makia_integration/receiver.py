@@ -54,10 +54,20 @@ class PollCoalescer:
     def kick(self) -> None:
         self._wake.set()
 
-    def close(self) -> None:
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def request_close(self) -> None:
+        """Ask the worker to end after its current run; never joins."""
         self._closed = True
         self._wake.set()
-        self._thread.join(timeout=5)
+
+    def join(self, timeout: float | None = None) -> None:
+        self._thread.join(timeout)
+
+    def close(self) -> None:
+        self.request_close()
+        self.join(5)
 
     def _loop(self) -> None:
         while True:
@@ -68,7 +78,7 @@ class PollCoalescer:
             try:
                 self._run()
             except Exception:
-                log.exception("poll failed")
+                log.exception("round failed")
 
 
 def make_server(coalescer: PollCoalescer, secret: str, port: int) -> ThreadingHTTPServer:
@@ -105,17 +115,3 @@ def make_server(coalescer: PollCoalescer, secret: str, port: int) -> ThreadingHT
             log.debug(format, *args)
 
     return ThreadingHTTPServer(("0.0.0.0", port), Handler)
-
-
-def serve(integration: Any, secret: str, port: int) -> None:
-    """Listen until interrupted. Polls once at start (deliveries missed while
-    the receiver was down are in the feed)."""
-    coalescer = PollCoalescer(integration.poll)
-    coalescer.kick()
-    server = make_server(coalescer, secret, port)
-    log.info("listening on :%d", server.server_port)
-    try:
-        server.serve_forever()
-    finally:
-        server.server_close()
-        coalescer.close()

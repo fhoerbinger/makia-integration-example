@@ -1,0 +1,35 @@
+# Your MAKIA integration
+
+This folder is a working starter. It runs against a small sample database (the file
+`sample-integration.db`), and `pytest` uses an in-memory copy, so you can see it work before
+you change anything.
+
+Warning: the sample rows are sent to the MAKIA in your env file. Replace `connect()`
+first (step 3), before you run `sync`, `send` or `run`.
+
+## Five minutes
+
+1. Check it works: `pytest`
+2. Copy `.env.example` to `.env`, fill in `MAKIA_API_URL`, `MAKIA_SYNC_TOKEN`,
+   `MAKIA_RUN_TOKEN`, and either `MAKIA_STORAGE_CONNECTION_ID` or `MAKIA_FILES_DIR`.
+3. Open `integration.py`. Replace `connect()` and each `# TODO` query with your own tables.
+   Set `PARAM` to your driver's placeholder (`?` or `%s`).
+4. Check the setup: `makia-integration --env-file .env --integration integration:integration doctor`
+5. Do the steps once, by hand:
+
+       makia-integration --env-file .env --integration integration:integration sync
+       makia-integration --env-file .env --integration integration:integration send
+       makia-integration --env-file .env --integration integration:integration poll
+
+6. Keep it running: see `makia-integration.service` (a systemd unit), or run
+   `makia-integration --env-file .env --integration integration:integration run`. Webhooks (`--listen`)
+   are a later step; see the guide, "Running as a service".
+
+The full guide: run `makia-integration docs` and open `guide.md` in that folder.
+
+## Files
+
+- `integration.py`: the source (what to send), the sink (where results go), the factory.
+- `test_integration.py`: runs the integration against a fake MAKIA. Keep it passing.
+- `.env.example`: every setting, with a note.
+- `makia-integration.service`: a systemd unit that runs the integration as a service.

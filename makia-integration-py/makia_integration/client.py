@@ -7,14 +7,17 @@ against MAKIA's published API description (openapi.json).
 from __future__ import annotations
 
 import mimetypes
+import ssl
 import time
-from contextlib import ExitStack
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+
+from makia_integration.model import ConfigError
 
 ROUTES_USED: tuple[tuple[str, str], ...] = (
     ("POST", "/auth/token"),
@@ -35,8 +38,15 @@ ROUTES_USED: tuple[tuple[str, str], ...] = (
     ("GET", "/webhooks/{id}/deliveries"),
 )
 
+__version__ = "0.1.0"
+_USER_AGENT = f"makia-integration/{__version__}"
+
 # Swap a little before the 15-minute access token runs out.
 _REFRESH_MARGIN_S = 60
+
+
+class TransportFailed(Exception):
+    """A request could not reach MAKIA, even after the retries."""
 
 
 @dataclass
@@ -62,6 +72,26 @@ def _content_type(file: Path) -> str:
     return mimetypes.guess_type(file.name)[0] or "application/octet-stream"
 
 
+def tls_context(ca_bundle: str | None) -> ssl.SSLContext:
+    """The trust store every call uses: `ca_bundle` if given, else the system store
+    (on Windows, its certificate store), so a company CA there is trusted.
+
+    Not strict (Python 3.13 turns VERIFY_X509_STRICT on, which refuses many company
+    CAs). With a bundle, any certificate in it is a trust anchor (PARTIAL_CHAIN), so
+    the chain `doctor` saves (server certificate and intermediates, often no root)
+    works as it is."""
+    try:
+        ctx = ssl.create_default_context(cafile=ca_bundle)
+    except (ssl.SSLError, OSError) as err:
+        raise ConfigError(
+            f"MAKIA_CA_BUNDLE {ca_bundle} is not a readable PEM certificate file ({err})"
+        ) from err
+    ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+    if ca_bundle:
+        ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+    return ctx
+
+
 class MakiaClient:
     """One service account's view of MAKIA.
 
@@ -77,10 +107,20 @@ class MakiaClient:
         *,
         transport: httpx.BaseTransport | None = None,
         timeout: float = 30.0,
+        verify: str | bool | ssl.SSLContext | None = None,
+        retries: int = 4,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._secret = secret
+        self._retries = retries
+        self._sleep = sleep
         self._http = httpx.Client(
-            base_url=base_url.rstrip("/"), transport=transport, timeout=timeout
+            base_url=base_url.rstrip("/"),
+            transport=transport,
+            timeout=timeout,
+            verify=tls_context(None) if verify is None else verify,
+            trust_env=True,
+            headers={"User-Agent": _USER_AGENT},
         )
         self._access: str | None = None
         self._expires_at = 0.0
@@ -88,10 +128,39 @@ class MakiaClient:
     def close(self) -> None:
         self._http.close()
 
+    def _send(
+        self, method: str, path: str, *, retries: int | None = None, **kwargs: Any
+    ) -> httpx.Response:
+        """One request, retried on transport errors, 429 and 5xx with a doubling
+        delay (capped at 30 s); a Retry-After in seconds wins."""
+        retries = self._retries if retries is None else retries
+        for attempt in range(retries + 1):
+            last = attempt == retries
+            try:
+                resp = self._http.request(method, path, **kwargs)
+            except httpx.TransportError as exc:
+                if last:
+                    raise TransportFailed(f"{method} {path}: {exc}") from exc
+                self._sleep(min(0.5 * 2**attempt, 30))
+                continue
+            if resp.status_code != 429 and resp.status_code < 500:
+                return resp
+            if last:
+                return resp
+            delay = min(0.5 * 2**attempt, 30)
+            try:
+                after = float(resp.headers["Retry-After"])
+            except (KeyError, ValueError):
+                after = -1.0
+            if 0 <= after:
+                delay = min(after, 30.0)
+            self._sleep(delay)
+        raise AssertionError("unreachable")
+
     # --- auth -------------------------------------------------------------
 
     def _swap(self) -> str:
-        resp = self._http.post("/auth/token", json={"token": self._secret})
+        resp = self._send("POST", "/auth/token", json={"token": self._secret})
         if resp.status_code != 200:
             raise _error(resp)
         body = resp.json()
@@ -104,13 +173,21 @@ class MakiaClient:
             return self._swap()
         return self._access
 
-    def _call(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
-        resp = self._http.request(
-            method, path, headers={"Authorization": f"Bearer {self._token()}"}, **kwargs
+    def _call(
+        self, method: str, path: str, *, retries: int | None = None, **kwargs: Any
+    ) -> httpx.Response:
+        token = self._token()
+        resp = self._send(
+            method, path, retries=retries, headers={"Authorization": f"Bearer {token}"}, **kwargs
         )
         if resp.status_code == 401:
-            resp = self._http.request(
-                method, path, headers={"Authorization": f"Bearer {self._swap()}"}, **kwargs
+            token = self._swap()
+            resp = self._send(
+                method,
+                path,
+                retries=retries,
+                headers={"Authorization": f"Bearer {token}"},
+                **kwargs,
             )
         return resp
 
@@ -150,7 +227,9 @@ class MakiaClient:
         )
         body = {"external_id": external_id, "sources": sources}
         # Inbound takes the secret itself, not an access token.
-        resp = self._http.post(path, json=body, headers={"Authorization": f"Bearer {self._secret}"})
+        resp = self._send(
+            "POST", path, json=body, headers={"Authorization": f"Bearer {self._secret}"}
+        )
         if resp.status_code not in (200, 202):
             raise _error(resp)
         return resp.status_code, resp.json()
@@ -169,17 +248,18 @@ class MakiaClient:
             f"/inbound/projects/{quote(project_external_id, safe='')}"
             f"/workflows/{quote(workflow_slug, safe='')}/runs"
         )
-        with ExitStack() as stack:
-            parts = [
-                (input_id, (file.name, stack.enter_context(file.open("rb")), _content_type(file)))
-                for input_id, file in files
-            ]
-            resp = self._http.post(
-                path,
-                data={"external_id": external_id},
-                files=parts,
-                headers={"Authorization": f"Bearer {self._secret}"},
-            )
+        # Bytes, not open handles: a retry must be able to send the body again.
+        parts = [
+            (input_id, (file.name, file.read_bytes(), _content_type(file)))
+            for input_id, file in files
+        ]
+        resp = self._send(
+            "POST",
+            path,
+            data={"external_id": external_id},
+            files=parts,
+            headers={"Authorization": f"Bearer {self._secret}"},
+        )
         if resp.status_code not in (200, 202):
             raise _error(resp)
         return resp.status_code, resp.json()
@@ -219,7 +299,8 @@ class MakiaClient:
         blueprints: list[str] | None = None,
         types: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Answers {webhook, secret}; the secret is shown once."""
+        """Answers {webhook, secret}; the secret is shown once. Never retried: a retry
+        after a lost answer would create a second webhook."""
         body: dict[str, Any] = {"name": name, "connection_id": connection_id, "path": path}
         for key, value in (
             ("projects", projects),
@@ -229,7 +310,7 @@ class MakiaClient:
         ):
             if value:
                 body[key] = value
-        return self._json("POST", "/webhooks", ok=(201,), json=body)
+        return self._json("POST", "/webhooks", ok=(201,), retries=0, json=body)
 
     def webhooks(self) -> list[dict[str, Any]]:
         return self._json("GET", "/webhooks")["webhooks"]

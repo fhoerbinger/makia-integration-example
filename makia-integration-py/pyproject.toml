@@ -1,0 +1,35 @@
+[project]
+name = "makia-integration"
+dynamic = ["version"]
+description = "Connect a customer system to MAKIA through its stable API."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.12"
+dependencies = ["httpx>=0.27"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+makia-integration = "makia_integration.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "makia_integration/client.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["makia_integration"]
+include = ["makia_integration/**"]
+# Gitignored (the monorepo copy is generated), so hatch skips it unless named here.
+artifacts = ["makia_integration/docs/openapi.json"]
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["makia_integration/docs/template"]

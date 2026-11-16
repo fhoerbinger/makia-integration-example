@@ -40,10 +40,12 @@ class FakeIntegration:
         self.polls = 0
         self.gate: threading.Event | None = None
         self.started = threading.Event()
+        self.ticked = threading.Event()  # set on every poll
 
     def poll(self) -> None:
         self.polls += 1
         self.started.set()
+        self.ticked.set()
         if self.gate is not None and self.polls == 1:
             self.gate.wait(30)  # held until the test opens it, also on a slow machine
 
@@ -66,15 +68,6 @@ def post(port: int, body: bytes, *, signature: str | None = None, ts: str | None
         return err.code
 
 
-def wait_for(cond, timeout=5.0):
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        if cond():
-            return True
-        time.sleep(0.01)
-    return False
-
-
 def start(integration: FakeIntegration):
     coalescer = PollCoalescer(integration.poll)
     server = make_server(coalescer, SECRET, 0)
@@ -87,10 +80,11 @@ def test_delivery_triggers_poll():
     server, coalescer = start(integration)
     try:
         assert post(server.server_port, b'{"seq":1}') == 204
-        assert wait_for(lambda: integration.polls == 1)
+        assert integration.ticked.wait(5)
         assert post(server.server_port, b"{}", signature="sha256=00") == 401
         assert post(server.server_port, b"{}", ts=str(int(time.time()) - 900)) == 401
-        time.sleep(0.1)
+        integration.ticked.clear()
+        assert not integration.ticked.wait(0.1)  # refused deliveries poll nothing
         assert integration.polls == 1
     finally:
         server.shutdown()
@@ -106,9 +100,11 @@ def test_three_deliveries_during_a_poll_run_one_more_poll():
         assert integration.started.wait(5)  # first poll is running, held open
         for _ in range(3):
             assert post(server.server_port, b"{}") == 204  # answered at once
+        integration.ticked.clear()
         integration.gate.set()
-        assert wait_for(lambda: integration.polls >= 2), integration.polls
-        time.sleep(0.2)
+        assert integration.ticked.wait(5)  # the one more poll
+        integration.ticked.clear()
+        assert not integration.ticked.wait(0.2)  # and no third
         assert integration.polls == 2
     finally:
         server.shutdown()
@@ -140,29 +136,16 @@ def test_bad_content_length_is_400():
         coalescer.close()
 
 
-def test_a_real_sqlite_integration_polls_on_the_coalescer_thread(tmp_path):
-    """The connection is built on this thread, the poll runs on the coalescer's."""
-    from fake_makia import RUN_SECRET, SYNC_SECRET, FakeMakia
+def test_an_escaping_error_is_logged_as_a_failed_round_not_a_poll(caplog):
+    ran = threading.Event()
 
-    from makia_integration.api import MakiaClient
-    from makia_integration.db import connect, create_schema, get_state
-    from makia_integration.jobs import Integration
+    def run():
+        ran.set()
+        raise RuntimeError("factory bug")
 
-    makia = FakeMakia()
-    conn, dialect = connect(str(tmp_path / "integration.db"))
-    create_schema(conn, dialect)
-    url = "https://makia.example"
-    integration = Integration(
-        conn=conn,
-        sync_api=MakiaClient(url, SYNC_SECRET, transport=makia.transport()),
-        run_api=MakiaClient(url, RUN_SECRET, transport=makia.transport()),
-        storage_connection_id="c",
-    )
-    server, coalescer = start(integration)
-    try:
-        assert post(server.server_port, b"{}") == 204
-        assert wait_for(lambda: ("GET", "/changes/head") in makia.calls)
-        assert wait_for(lambda: get_state(conn, "feed_marker") == "0")
-    finally:
-        server.shutdown()
-        coalescer.close()
+    with caplog.at_level("ERROR", logger="makia_integration"):
+        c = PollCoalescer(run)
+        c.kick()
+        assert ran.wait(2)
+        c.close()
+    assert "round failed" in caplog.text and "poll failed" not in caplog.text

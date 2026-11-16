@@ -1,0 +1,145 @@
+"""Drives the integration against a fake MAKIA: sync, send, views built, poll.
+
+Run it with `pytest`. It needs no network. When you change `integration.py`, keep it
+passing; change the sample rows it checks to match your own queries."""
+
+from __future__ import annotations
+
+import pytest
+
+from integration import integration
+from makia_integration import Config, MakiaClient, Record, RunRef, SentRun
+from makia_integration.testing import RUN_SECRET, SYNC_SECRET, FakeMakia, row
+
+URL = "https://makia.example"
+
+
+def memory_db():
+    """The sample database in memory, so a test leaves no file behind."""
+    import sqlite3
+
+    import integration as module
+
+    db = sqlite3.connect(":memory:")
+    db.executescript(module.SAMPLE_SCHEMA + module.SAMPLE_ROWS)
+    return db
+
+
+@pytest.fixture
+def makia(monkeypatch):
+    import integration as module
+
+    monkeypatch.setattr(module, "connect", memory_db)
+    fake = FakeMakia()
+
+    def clients(self):
+        return (
+            MakiaClient(URL, SYNC_SECRET, transport=fake.transport(), sleep=lambda s: None),
+            MakiaClient(URL, RUN_SECRET, transport=fake.transport(), sleep=lambda s: None),
+        )
+
+    monkeypatch.setattr(Config, "clients", clients)
+    return fake
+
+
+@pytest.fixture
+def config(tmp_path):
+    return Config(
+        api_url=URL,
+        sync_token=SYNC_SECRET,
+        run_token=RUN_SECRET,
+        storage_connection_id="conn-1",
+        files_dir=None,
+        state_file=tmp_path / "state.db",
+        ca_bundle=None,
+        integration_ref=None,
+        webhook_secret=None,
+    )
+
+
+def test_sync_send_poll(makia, config):
+    b = integration(config)
+    try:
+        assert b.sync().projects == 2
+        assert b.send().sent == 2
+        rows = b.sink.db.execute(
+            "SELECT record_external_id, status, review_url FROM record_runs ORDER BY 1"
+        ).fetchall()
+        assert [r[:2] for r in rows] == [("DOC-77812", "sent"), ("DOC-77813", "sent")]
+        run_id = "run-1"
+
+        makia.set_rows(run_id, "overview", [row("u1"), row("u2", state="approved")])
+        makia.emit("run.views_built", run_id=run_id, views=["overview"])
+        makia.emit("run.succeeded", run_id=run_id, status="succeeded")
+        assert b.poll().views_read == 1
+
+        results = b.sink.db.execute(
+            "SELECT unit_key, review_state, url FROM record_results ORDER BY unit_key"
+        ).fetchall()
+        assert [r[:2] for r in results] == [("u1", "none"), ("u2", "approved")]
+        assert all(r[2].startswith("https://studio.example/") for r in results)
+        status = b.sink.db.execute(
+            "SELECT status FROM record_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        assert status == ("succeeded",)
+    finally:
+        b.close()
+
+
+def test_repeated_delivery_changes_nothing(makia, config):
+    b = integration(config)
+    try:
+        b.sync()
+        b.send()
+        makia.set_rows("run-1", "overview", [row("u1"), row("u2")])
+        makia.emit("run.views_built", run_id="run-1", views=["overview"])
+        b.poll()
+        # A rebuild with one row fewer: the old generation's row goes at view_done.
+        makia.set_rows("run-1", "overview", [row("u1")], generation="g2")
+        makia.emit("run.views_built", run_id="run-1", views=["overview"])
+        b.poll()
+        keys = b.sink.db.execute("SELECT unit_key, generation FROM record_results").fetchall()
+        assert keys == [("u1", "g2")]
+        # The same page again (at-least-once) must not duplicate or fail.
+        b.read_results(RunRef("DOC-77812", "case-1", "run-1"), "overview")
+        assert b.sink.db.execute("SELECT COUNT(*) FROM record_results").fetchone() == (1,)
+    finally:
+        b.close()
+
+
+def test_the_state_file_is_released_when_building_fails(makia, config, monkeypatch):
+    import integration as module
+
+    def broken():
+        raise RuntimeError("no database")
+
+    monkeypatch.setattr(module, "connect", broken)
+    with pytest.raises(RuntimeError):
+        integration(config)
+    config.open_state().close()  # would raise StateLocked if the first attempt kept it
+
+
+def test_a_repeated_run_sent_keeps_the_final_status(makia, config):
+    b = integration(config)
+    try:
+        b.sync()
+        b.send()
+        makia.emit("run.succeeded", run_id="run-1", status="succeeded")
+        b.poll()
+        record = Record("DOC-77812", "2026-114", "invoice-check", "invoices")
+        b.sink.run_sent(record, SentRun("case-1", "run-1", "https://studio.example/new", True))
+        assert b.sink.db.execute(
+            "SELECT status, review_url FROM record_runs WHERE record_external_id = 'DOC-77812'"
+        ).fetchone() == ("succeeded", "https://studio.example/new")
+    finally:
+        b.close()
+
+
+def test_closing_the_integration_closes_the_database(makia, config):
+    import sqlite3
+
+    b = integration(config)
+    b.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        b.sink.db.execute("SELECT 1")
+    config.open_state().close()  # the state file was released too
