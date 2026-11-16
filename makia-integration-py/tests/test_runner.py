@@ -344,3 +344,36 @@ def test_describe_shapes_the_log_line(caplog):
         assert _until(lambda: "send failed: explained" in caplog.text)
         runner.stop()
         runner.join(timeout=2)
+
+
+def test_a_sync_refusal_is_logged_but_does_not_rebuild(caplog):
+    from makia_integration.integration import SyncError, SyncReport
+
+    built: list[StubIntegration] = []
+    polls = threading.Semaphore(0)
+
+    def factory():
+        integration = StubIntegration()
+        integration.on_step = lambda n: polls.release() if n == "poll" else None
+
+        def sync():
+            integration.log.append("sync")
+            raise SyncError(["p1"], ["p1 (409 slug_taken)"], SyncReport(2, 0))
+
+        integration.sync = sync  # type: ignore[method-assign]
+        built.append(integration)
+        return integration
+
+    runner = Runner(factory, interval=None, listen_port=None, webhook_secret=None)
+    with caplog.at_level("ERROR", logger="makia_integration"):
+        runner.start()
+        assert polls.acquire(timeout=2)
+        runner._coalescer.kick()
+        assert polls.acquire(timeout=2)
+        assert _until(lambda: len(built[0].log) == 6)
+        runner.stop()
+        runner.join(timeout=2)
+    assert len(built) == 1  # the same integration, never closed
+    assert built[0].log == ["sync", "send", "poll", "sync", "send", "poll"]
+    assert "sync failed: SyncError: 1 of 2 projects refused" in caplog.text
+    assert isinstance(runner.last_error, SyncError)  # kept: the refusal lasts

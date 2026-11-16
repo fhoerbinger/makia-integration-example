@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Protocol
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 OPEN_STATUSES = ("sent", "running")
 
@@ -31,6 +31,11 @@ class RunEntry:
     error_code: str | None
     sink_pending: bool
     progress_at: str | None
+    # The rest of the record, so a pending sink call can still be delivered after the
+    # record left the source. None in entries stored before schema version 2.
+    project_external_id: str | None = None
+    workflow_slug: str | None = None
+    input_id: str | None = None
 
 
 class StateStore(Protocol):
@@ -60,7 +65,11 @@ class StateStore(Protocol):
 
     def touch_progress(self, run_id: str, at: str) -> None: ...
 
-    def clear_refusals(self, record_external_id: str | None) -> int: ...
+    def clear_refusals(self, record_external_id: str | None) -> list[str]: ...
+
+    def clear_gone(self) -> list[str]: ...
+
+    def drop_pending(self, record_external_id: str) -> bool: ...
 
     def transaction(self): ...
 
@@ -103,7 +112,8 @@ def _unlock(fh: IO[bytes]) -> None:
 
 
 _COLUMNS = (
-    "record_external_id, case_id, run_id, review_url, status, error_code, sink_pending, progress_at"
+    "record_external_id, case_id, run_id, review_url, status, error_code, sink_pending, "
+    "progress_at, project_external_id, workflow_slug, input_id"
 )
 
 _MIGRATIONS = [
@@ -125,11 +135,16 @@ _MIGRATIONS = [
         PRIMARY KEY (run_id, view)
     );
     """,
+    """
+    ALTER TABLE runs ADD COLUMN project_external_id TEXT;
+    ALTER TABLE runs ADD COLUMN workflow_slug TEXT;
+    ALTER TABLE runs ADD COLUMN input_id TEXT;
+    """,
 ]
 
 
 def _entry(row: tuple) -> RunEntry:
-    return RunEntry(*row[:6], bool(row[6]), row[7])
+    return RunEntry(*row[:6], bool(row[6]), *row[7:])
 
 
 class SqliteStateStore:
@@ -216,7 +231,7 @@ class SqliteStateStore:
 
     def upsert_run(self, entry: RunEntry) -> None:
         self._db.execute(
-            f"INSERT OR REPLACE INTO runs({_COLUMNS}) VALUES (?,?,?,?,?,?,?,?)",
+            f"INSERT OR REPLACE INTO runs({_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
                 entry.record_external_id,
                 entry.case_id,
@@ -226,6 +241,9 @@ class SqliteStateStore:
                 entry.error_code,
                 int(entry.sink_pending),
                 entry.progress_at,
+                entry.project_external_id,
+                entry.workflow_slug,
+                entry.input_id,
             ),
         )
 
@@ -242,7 +260,7 @@ class SqliteStateStore:
     def open_runs(self, limit: int) -> list[RunEntry]:
         rows = self._db.execute(
             f"SELECT {_COLUMNS} FROM runs WHERE status IN ('sent','running') "
-            "AND run_id IS NOT NULL "
+            "AND run_id IS NOT NULL AND sink_pending=0 "
             "ORDER BY progress_at IS NOT NULL, progress_at, record_external_id LIMIT ?",
             (limit,),
         ).fetchall()
@@ -283,10 +301,27 @@ class SqliteStateStore:
     def touch_progress(self, run_id: str, at: str) -> None:
         self._db.execute("UPDATE runs SET progress_at=? WHERE run_id=?", (at, run_id))
 
-    def clear_refusals(self, record_external_id: str | None) -> int:
-        sql = "DELETE FROM runs WHERE status IN ('refused_final', 'no_run')"
-        args: tuple = ()
-        if record_external_id is not None:
-            sql += " AND record_external_id=?"
-            args = (record_external_id,)
-        return self._db.execute(sql, args).rowcount
+    def _delete(self, where: str, args: tuple) -> list[str]:
+        with self.transaction():
+            rows = self._db.execute(
+                f"SELECT record_external_id FROM runs WHERE {where} ORDER BY record_external_id",
+                args,
+            ).fetchall()
+            self._db.execute(f"DELETE FROM runs WHERE {where}", args)
+        return [r[0] for r in rows]
+
+    def clear_refusals(self, record_external_id: str | None) -> list[str]:
+        """All records refused for good or `no_run`; one record also when `gone`
+        (404 run_not_found also answers a run the caller cannot see for a while)."""
+        if record_external_id is None:
+            return self._delete("status IN ('refused_final', 'no_run')", ())
+        return self._delete(
+            "status IN ('refused_final', 'no_run', 'gone') AND record_external_id=?",
+            (record_external_id,),
+        )
+
+    def clear_gone(self) -> list[str]:
+        return self._delete("status='gone'", ())
+
+    def drop_pending(self, record_external_id: str) -> bool:
+        return bool(self._delete("sink_pending=1 AND record_external_id=?", (record_external_id,)))

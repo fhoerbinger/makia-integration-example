@@ -21,7 +21,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from makia_integration import __version__
-from makia_integration.integration import Integration, ConfigError, SyncError
+from makia_integration.integration import Integration, ConfigError, SendError, SyncError
 from makia_integration.client import ApiError, TransportFailed
 from makia_integration.doctor import render, run_checks
 from makia_integration.config import Config, load_integration, load_config, read_env_file
@@ -78,10 +78,17 @@ def _parser() -> argparse.ArgumentParser:
     listen = add("listen", "receive webhooks and run a round on each")
     listen.add_argument("--port", type=int, default=8080, help="port to listen on (8080)")
     listen.add_argument("--sync-every", type=_positive, default=60, help="sync every N rounds (60)")
-    retry = add("retry", "let refused records be sent again")
+    retry = add("retry", "let refused or gone records be sent again")
     which = retry.add_mutually_exclusive_group(required=True)
-    which.add_argument("external_id", nargs="?", help="one record's external id")
-    which.add_argument("--all-refused", action="store_true", help="every refused record")
+    which.add_argument("external_id", nargs="?", help="one record's external id (refused or gone)")
+    which.add_argument("--all-refused", action="store_true", help="every record refused for good")
+    which.add_argument(
+        "--all-gone",
+        action="store_true",
+        help="every gone run; a case deleted on purpose gets a new case and run",
+    )
+    drop = add("drop-pending", "forget a sink call that cannot be delivered")
+    drop.add_argument("external_id", help="the record's external id")
     doctor = add("doctor", "check the setup; run this first")
     doctor.add_argument("--listen", type=int, metavar="PORT", help="check the port can be bound")
     add("docs", "print the path of the bundled guides")
@@ -281,23 +288,51 @@ def _doctor(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     return 0 if all(c.ok for c in checks) else 1
 
 
-def _retry(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+def _open_existing_state(env: Mapping[str, str]) -> SqliteStateStore:
     config = load_config(env, require=())
     if not config.state_file.exists():
         raise ConfigError(
             f"{config.state_file} does not exist (set MAKIA_STATE_FILE to the integration's state file)"
         )
-    store = SqliteStateStore(config.state_file)
+    return SqliteStateStore(config.state_file)
+
+
+def _retry(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    store = _open_existing_state(env)
     try:
-        cleared = store.clear_refusals(None if args.all_refused else args.external_id)
+        if args.all_gone:
+            cleared, what = store.clear_gone(), "gone"
+        else:
+            ext_id = None if args.all_refused else args.external_id
+            cleared = store.clear_refusals(ext_id)
+            what = "refused" if args.all_refused else "refused or gone"
     finally:
         store.close()
     if cleared:
-        print(f"cleared {cleared} refused record(s); the next send tries them again")
-    elif args.all_refused:
-        print("cleared 0: no record is refused")
+        print(
+            f"cleared {len(cleared)} {what} record(s): {', '.join(cleared)}; "
+            "the next send tries them again"
+        )
+    elif args.external_id:
+        print(f"cleared 0: {args.external_id} is not refused or gone")
     else:
-        print(f"cleared 0: {args.external_id} is not refused")
+        print(f"cleared 0: no record is {what}")
+    return 0
+
+
+def _drop_pending(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    store = _open_existing_state(env)
+    try:
+        dropped = store.drop_pending(args.external_id)
+    finally:
+        store.close()
+    if not dropped:
+        print(f"{PROG}: {args.external_id} has no pending sink call", file=sys.stderr)
+        return 1
+    print(
+        f"dropped {args.external_id}: its pending sink call will not be made; "
+        "if records() returns it again, the next send sends it again"
+    )
     return 0
 
 
@@ -328,6 +363,8 @@ def _dispatch(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         return _doctor(args, env)
     if cmd == "retry":
         return _retry(args, env)
+    if cmd == "drop-pending":
+        return _drop_pending(args, env)
     if cmd == "webhook":
         return _run_webhook(load_config(env, require=("MAKIA_API_URL", "MAKIA_RUN_TOKEN")), args)
     config = load_config(env, sending=cmd in SENDING)
@@ -350,7 +387,7 @@ def _describe(err: BaseException, env: Mapping[str, str]) -> tuple[str, int]:
         )
     if isinstance(err, ApiError):
         return f"MAKIA answered {err} (check the token, its permissions and the ids)", 1
-    if isinstance(err, SyncError):
+    if isinstance(err, (SyncError, SendError)):
         return str(err), 1
     return f"{type(err).__name__}: {err}", 1
 

@@ -88,11 +88,11 @@ def test_clear_refusals_one_and_all(state):
     state.upsert_run(entry("a", status="refused_final"))
     state.upsert_run(entry("b", status="refused_final"))
     state.upsert_run(entry("c", status="refused"))
-    assert state.clear_refusals("a") == 1
+    assert state.clear_refusals("a") == ["a"]
     assert state.run_by_record("a") is None
-    assert state.clear_refusals("c") == 0
+    assert state.clear_refusals("c") == []
     assert state.run_by_record("c").status == "refused"
-    assert state.clear_refusals(None) == 1
+    assert state.clear_refusals(None) == ["b"]
     assert state.run_by_record("b") is None
     assert state.run_by_record("c") is not None
 
@@ -147,16 +147,16 @@ def test_schema_version_row(tmp_path):
     path = tmp_path / "state.db"
     SqliteStateStore(path).close()
     db = sqlite3.connect(path)
-    assert db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "1"
+    assert db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "2"
     db.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
     db.commit()
     db.close()
     with pytest.raises(RuntimeError) as ei:
         SqliteStateStore(path)
-    assert "5" in str(ei.value) and "1" in str(ei.value)
+    assert "5" in str(ei.value) and "2" in str(ei.value)
     # the failed open must not leave the lock held
     db = sqlite3.connect(path)
-    db.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+    db.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
     db.commit()
     db.close()
     SqliteStateStore(path).close()
@@ -167,3 +167,68 @@ def test_path_with_spaces_and_missing_parent(tmp_path):
     store.set_marker(1)
     store.close()
     assert (tmp_path / "a b" / "state.db").exists()
+
+
+def test_clear_refusals_one_clears_gone_all_does_not(state):
+    state.upsert_run(entry("a", status="gone", error_code="run_not_found"))
+    state.upsert_run(entry("b", status="gone", error_code="run_not_found"))
+    state.upsert_run(entry("c", status="succeeded"))
+    state.upsert_run(entry("d", status="no_run"))
+    assert state.clear_refusals("a") == ["a"]
+    assert state.run_by_record("a") is None
+    assert state.clear_refusals(None) == ["d"]  # --all-refused: gone stays
+    assert state.run_by_record("b").status == "gone"
+    assert state.clear_gone() == ["b"]
+    assert state.run_by_record("b") is None
+    assert state.run_by_record("c").status == "succeeded"
+
+
+def test_drop_pending_deletes_only_a_pending_entry(state):
+    state.upsert_run(entry("a", sink_pending=True))
+    state.upsert_run(entry("b"))
+    assert state.drop_pending("b") is False and state.run_by_record("b") is not None
+    assert state.drop_pending("a") is True and state.run_by_record("a") is None
+    assert state.drop_pending("zz") is False
+
+
+def test_open_runs_skips_sink_pending(state):
+    state.upsert_run(entry("a", sink_pending=True))
+    state.upsert_run(entry("b"))
+    assert [e.record_external_id for e in state.open_runs(1)] == ["b"]
+
+
+def test_entry_keeps_the_record_fields(state):
+    state.upsert_run(entry("a", project_external_id="p", workflow_slug="w", input_id="i"))
+    got = state.run_by_record("a")
+    assert (got.project_external_id, got.workflow_slug, got.input_id) == ("p", "w", "i")
+
+
+def test_version_1_file_is_migrated(tmp_path):
+    path = tmp_path / "state.db"
+    db = sqlite3.connect(path)
+    db.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO meta VALUES ('schema_version', '1'), ('marker', '4');
+        CREATE TABLE runs (
+            record_external_id TEXT PRIMARY KEY, case_id TEXT, run_id TEXT UNIQUE,
+            review_url TEXT, status TEXT NOT NULL, error_code TEXT,
+            sink_pending INTEGER NOT NULL DEFAULT 0, progress_at TEXT
+        );
+        CREATE INDEX runs_case ON runs(case_id);
+        CREATE TABLE views_read (run_id TEXT NOT NULL, view TEXT NOT NULL,
+            PRIMARY KEY (run_id, view));
+        INSERT INTO runs VALUES ('a', 'c', 'r', NULL, 'sent', NULL, 1, NULL);
+        """
+    )
+    db.close()
+    store = SqliteStateStore(path)
+    try:
+        got = store.run_by_record("a")
+        assert got.run_id == "r" and got.sink_pending and got.project_external_id is None
+        assert store.marker() == 4
+    finally:
+        store.close()
+    db = sqlite3.connect(path)
+    assert db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "2"
+    db.close()

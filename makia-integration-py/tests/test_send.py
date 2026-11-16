@@ -9,6 +9,7 @@ from makia_integration.integration import (
     FIXABLE_REFUSALS,
     MAX_FILE_BYTES,
     Integration,
+    SendError,
     SendReport,
 )
 from makia_integration.client import ApiError
@@ -92,7 +93,7 @@ def test_sink_failure_is_redelivered(integration, source, sink, makia, state):
     try:
         integration.send()
         raise AssertionError("expected failure")
-    except RuntimeError:
+    except SendError:
         pass
     assert state.pending_sink()
     before = posts(makia)
@@ -208,7 +209,7 @@ def test_final_refusal_redelivered_after_sink_failure(integration, source, sink,
     try:
         integration.send()
         raise AssertionError("expected failure")
-    except RuntimeError:
+    except SendError:
         pass
     makia.inbound_status = None
     before = posts(makia)
@@ -287,7 +288,7 @@ def test_known_record_without_a_run_is_no_run_and_does_not_block(
     integration.send()  # final until retry: not sent again, not reported again
     assert posts(makia) == before and names(sink) == ["run_refused", "run_sent"]
     assert state.open_runs(10) == [state.run_by_record(REC2.external_id)]
-    assert state.clear_refusals(REC.external_id) == 1
+    assert state.clear_refusals(REC.external_id) == [REC.external_id]
     del makia.cases[REC.external_id]  # someone started it again in MAKIA
     assert integration.send().sent == 1
 
@@ -302,7 +303,7 @@ def test_no_run_redelivered_after_sink_failure(integration, source, sink, makia,
     source._records = [REC]
     source._files = {REC.external_id: ["a.pdf"]}
     sink.fail_once("run_refused")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(SendError):
         integration.send()
     before = posts(makia)
     integration.send()
@@ -364,3 +365,89 @@ def test_close_calls_a_shared_source_and_sink_once(api, state):
         both, both, sync_api=api[0], run_api=api[1], state=state, files_dir=Path(".")
     ).close()
     assert Both.closes == 1
+
+
+def test_a_failing_run_sent_does_not_stop_the_pass(integration, source, sink, makia, state, caplog):
+    source._records = [REC, REC2]
+    source._files = {REC.external_id: ["a.pdf"], REC2.external_id: ["b.pdf"]}
+    sink.fail_once("run_sent")
+    with caplog.at_level("WARNING", logger="makia_integration"):
+        with pytest.raises(SendError) as ei:
+            integration.send()
+    assert REC.external_id in str(ei.value) and "sink failed: run_sent" in str(ei.value)
+    assert f"send {REC.external_id}: run_sent failed" in caplog.text
+    # the next record still went, and the failed one waits for the next pass
+    assert [c[1][0] for c in sink.calls] == [REC2]
+    assert state.run_by_record(REC.external_id).sink_pending is True
+    assert state.run_by_record(REC2.external_id).sink_pending is False
+    before = posts(makia)
+    integration.send()
+    assert posts(makia) == before and [c[1][0] for c in sink.calls] == [REC2, REC]
+    assert not state.pending_sink()
+
+
+def test_pending_run_sent_is_delivered_after_the_record_left_the_source(
+    integration, source, sink, makia, state
+):
+    source._records = [REC]
+    source._files = {REC.external_id: ["a.pdf"]}
+    sink.fail_once("run_sent")
+    with pytest.raises(SendError):
+        integration.send()
+    source._records = []  # the record dropped out of the source
+    before = posts(makia)
+    integration.send()
+    assert posts(makia) == before and names(sink) == ["run_sent"]
+    record, run = sink.calls[0][1]
+    assert record == REC  # rebuilt from the state file, whole
+    assert run.run_id == "run-1"
+    assert not state.pending_sink()
+
+
+@pytest.mark.parametrize("how", ["final", "no_run"])
+def test_pending_refusal_is_delivered_after_the_record_left_the_source(
+    integration, source, sink, makia, state, how
+):
+    source._records = [REC]
+    source._files = {REC.external_id: ["a.pdf"]}
+    if how == "final":
+        makia.inbound_status, makia.inbound_code = 415, "unsupported_media_type"
+    else:
+        makia.cases[REC.external_id] = {
+            "case_id": "c",
+            "run_id": None,
+            "status_url": None,
+            "review_url": None,
+        }
+    sink.fail_once("run_refused")
+    with pytest.raises(SendError):
+        integration.send()
+    source._records = []
+    integration.send()
+    code = "unsupported_media_type" if how == "final" else "no_run"
+    assert sink.calls == [("run_refused", (REC, code))]
+    assert not state.pending_sink()
+
+
+def test_pre_v2_pending_entry_is_delivered_with_a_warning(integration, sink, state, caplog):
+    from makia_integration.state import RunEntry
+
+    state.set_marker(0)
+    state.upsert_run(RunEntry("OLD-1", "c", "r", None, "sent", None, True, None))
+    with caplog.at_level("WARNING", logger="makia_integration"):
+        integration.send()
+    (record, _run) = sink.calls[0][1]
+    assert (record.external_id, record.project_external_id) == ("OLD-1", "")
+    assert "send OLD-1: stored before" in caplog.text
+
+
+def test_a_pending_entry_without_a_run_joins_the_send_error(integration, sink, state):
+    from makia_integration.state import RunEntry
+
+    state.set_marker(0)
+    state.upsert_run(RunEntry("BAD-1", None, None, None, "sent", None, True, None, "p", "w", "i"))
+    state.upsert_run(RunEntry("OK-1", "c", "r", None, "sent", None, True, None, "p", "w", "i"))
+    with pytest.raises(SendError) as ei:
+        integration.send()
+    assert "BAD-1" in str(ei.value) and "no run to deliver" in str(ei.value)
+    assert [c[1][0].external_id for c in sink.calls] == ["OK-1"]

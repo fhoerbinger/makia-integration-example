@@ -68,6 +68,22 @@ class SyncError(Exception):
         self.report = report
 
 
+class SendError(Exception):
+    """Some sink calls of a send pass raised; the other records went on. `failed`
+    names each one; they are tried again next pass."""
+
+    _NAMED = 5
+
+    def __init__(self, failed: list[str]) -> None:
+        named = "; ".join(failed[: self._NAMED])
+        more = len(failed) - self._NAMED
+        super().__init__(
+            f"{len(failed)} sink call(s) failed: {named}"
+            + (f"; and {more} more" if more > 0 else "")
+        )
+        self.failed = failed
+
+
 @dataclass(frozen=True, slots=True)
 class SyncReport:
     projects: int
@@ -235,13 +251,16 @@ class Integration:
         """Start a run for every source record not sent yet; tell the sink.
 
         Delivery to the sink is at-least-once: the run is stored with
-        `sink_pending` before `run_sent` and cleared after it returns."""
+        `sink_pending` before `run_sent` and cleared after it returns. A raising sink
+        call is logged, its record waits for the next pass, and the pass goes on;
+        at the end `SendError` names every record whose sink call failed."""
         problem = send_mode_problem(self.storage_connection_id, self.files_dir)
         if problem:
             raise ConfigError(problem)
         if self.state.marker() is None:
             self.state.set_marker(self.run_api.changes_head())
         sent = known = refused = skipped = 0
+        failed: list[str] = []
         seen: set[str] = set()
         for record in self.source.records():
             if record.external_id in seen:
@@ -249,24 +268,19 @@ class Integration:
             seen.add(record.external_id)
             entry = self.state.run_by_record(record.external_id)
             if entry is not None and entry.sink_pending:
-                if entry.status in ("refused_final", NO_RUN):
-                    assert entry.error_code is not None
-                    self.sink.run_refused(record, entry.error_code)
-                    self.state.upsert_run(replace(entry, sink_pending=False))
-                else:
-                    self._deliver(record, entry, known=False)
+                self._redeliver(record, entry, failed)
                 continue
             if entry is not None and entry.status in _DONE:
                 continue
             paths = self.source.files(record)
             if not paths:
-                self.sink.record_skipped(record, "no files")
+                self._tell(failed, record, "record_skipped", self.sink.record_skipped, "no files")
                 skipped += 1
                 continue
             try:
                 status, answer = self._post(record, paths)
             except _Skip as skip:
-                self.sink.record_skipped(record, str(skip))
+                self._tell(failed, record, "record_skipped", self.sink.record_skipped, str(skip))
                 skipped += 1
                 continue
             except (_Refuse, ApiError) as err:
@@ -284,35 +298,21 @@ class Integration:
                         err.status,
                     )
                 final = code in FINAL_REFUSALS
-                self.state.upsert_run(
-                    RunEntry(
-                        record.external_id,
-                        None,
-                        None,
-                        None,
-                        "refused_final" if final else "refused",
-                        code,
-                        final,
-                        None,
-                    )
+                entry = _new_entry(
+                    record, None, None, None, "refused_final" if final else "refused", code
                 )
+                self.state.upsert_run(replace(entry, sink_pending=final))
                 log.warning("send %s: refused (%s)", record.external_id, code)
-                self.sink.run_refused(record, code)
-                if final:
-                    self.state.upsert_run(
-                        RunEntry(
-                            record.external_id, None, None, None, "refused_final", code, False, None
-                        )
-                    )
+                told = self._tell(failed, record, "run_refused", self.sink.run_refused, code)
+                if final and told:
+                    self.state.upsert_run(entry)
                 refused += 1
                 continue
             if answer.get("run_id") is None:
                 # 200 for a known record whose case has no run any more: final until
                 # `retry`, so one deleted run never blocks the records after it.
-                entry = RunEntry(
-                    record.external_id, answer["case_id"], None, None, NO_RUN, NO_RUN, True, None
-                )
-                self.state.upsert_run(entry)
+                entry = _new_entry(record, answer["case_id"], None, None, NO_RUN, NO_RUN)
+                self.state.upsert_run(replace(entry, sink_pending=True))
                 log.warning(
                     "send %s: MAKIA knows it, but case %s has no run any more (deleted); "
                     "not sent again until `retry %s`",
@@ -320,20 +320,14 @@ class Integration:
                     answer["case_id"],
                     record.external_id,
                 )
-                self.sink.run_refused(record, NO_RUN)
-                self.state.upsert_run(replace(entry, sink_pending=False))
+                if self._tell(failed, record, "run_refused", self.sink.run_refused, NO_RUN):
+                    self.state.upsert_run(entry)
                 refused += 1
                 continue
-            entry = RunEntry(
-                record.external_id,
-                answer["case_id"],
-                answer["run_id"],
-                answer["review_url"],
-                "sent",
-                None,
-                True,
-                None,
+            entry = _new_entry(
+                record, answer["case_id"], answer["run_id"], answer["review_url"], "sent", None
             )
+            entry = replace(entry, sink_pending=True)
             self.state.upsert_run(entry)
             log.info(
                 "send %s: %s run %s",
@@ -341,20 +335,64 @@ class Integration:
                 "known" if status == 200 else "started",
                 answer["run_id"],
             )
-            self._deliver(record, entry, known=status == 200)
+            self._deliver(record, entry, failed, known=status == 200)
             if status == 200:
                 known += 1
             else:
                 sent += 1
+        # Pending sink calls of records the source no longer yields: from the state alone.
+        for entry in self.state.pending_sink():
+            if entry.record_external_id not in seen:
+                record = _record_of(entry)
+                log.info(
+                    "send %s: no longer in the source; delivering its pending sink call",
+                    record.external_id,
+                )
+                if entry.project_external_id is None:
+                    log.warning(
+                        "send %s: stored before state schema version 2; the sink gets the "
+                        "record with empty project_external_id, workflow_slug and input_id",
+                        record.external_id,
+                    )
+                self._redeliver(record, entry, failed)
+        if failed:
+            raise SendError(failed)
         return SendReport(sent, known, refused, skipped)
 
-    def _deliver(self, record: Record, entry: RunEntry, *, known: bool) -> None:
+    def _redeliver(self, record: Record, entry: RunEntry, failed: list[str]) -> None:
+        """Deliver the sink call a pending entry still owes."""
+        if entry.status in ("refused_final", NO_RUN):
+            assert entry.error_code is not None
+            if self._tell(failed, record, "run_refused", self.sink.run_refused, entry.error_code):
+                self.state.upsert_run(replace(entry, sink_pending=False))
+        else:
+            self._deliver(record, entry, failed, known=False)
+
+    def _deliver(self, record: Record, entry: RunEntry, failed: list[str], *, known: bool) -> None:
         if not (entry.case_id and entry.run_id):
-            raise RuntimeError(f"state entry for {record.external_id!r} has no run to deliver")
-        self.sink.run_sent(
-            record, SentRun(entry.case_id, entry.run_id, entry.review_url or "", known)
-        )
-        self.state.upsert_run(replace(entry, sink_pending=False))
+            problem = "state entry has no run to deliver"
+            log.warning("send %s: %s", record.external_id, problem)
+            failed.append(f"{record.external_id} ({problem})")
+            return
+        run = SentRun(entry.case_id, entry.run_id, entry.review_url or "", known)
+        if self._tell(failed, record, "run_sent", self.sink.run_sent, run):
+            self.state.upsert_run(replace(entry, sink_pending=False))
+
+    def _tell(self, failed: list[str], record: Record, what: str, call, arg: object) -> bool:
+        """Call the sink for one record; on a raise log one line, note it, return False."""
+        try:
+            call(record, arg)
+        except Exception as err:
+            log.warning(
+                "send %s: %s failed (%s: %s); tried again next pass",
+                record.external_id,
+                what,
+                type(err).__name__,
+                err,
+            )
+            failed.append(f"{record.external_id} ({what}: {type(err).__name__}: {err})")
+            return False
+        return True
 
     def _post(self, record: Record, paths: list[str]) -> tuple[int, dict]:
         if self.files_dir is None:
@@ -491,8 +529,6 @@ class Integration:
         for entry in self.state.open_runs(at_most):
             run_id = entry.run_id
             assert run_id is not None
-            if entry.sink_pending:
-                continue  # `send` delivers run_sent first
             try:
                 snapshot = self.run_api.run_progress(run_id)
             except ApiError as err:
@@ -606,6 +642,41 @@ def send_mode_problem(storage_connection_id: str, files_dir: Path | None) -> str
             "how files go to MAKIA"
         )
     return None
+
+
+def _new_entry(
+    record: Record,
+    case_id: str | None,
+    run_id: str | None,
+    review_url: str | None,
+    status: str,
+    error_code: str | None,
+) -> RunEntry:
+    """A state entry for a record (not pending), keeping what the sink's Record needs."""
+    return RunEntry(
+        record.external_id,
+        case_id,
+        run_id,
+        review_url,
+        status,
+        error_code,
+        False,
+        None,
+        record.project_external_id,
+        record.workflow_slug,
+        record.input_id,
+    )
+
+
+def _record_of(entry: RunEntry) -> Record:
+    """The record of a state entry. Entries stored before state schema version 2 do not
+    know the record's project, workflow and input: those are empty strings."""
+    return Record(
+        entry.record_external_id,
+        entry.project_external_id or "",
+        entry.workflow_slug or "",
+        entry.input_id or "",
+    )
 
 
 def _readable(entry: RunEntry | None) -> bool:

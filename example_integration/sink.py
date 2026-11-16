@@ -33,7 +33,8 @@ class DbSink:
 
     def run_sent(self, record: Record, run: SentRun) -> None:
         """May come again for the same run after its final status (at-least-once): the status
-        goes back to "sent" only for a new run of the record, never for this one."""
+        goes back to "sent" only for a new run of the record, never for this one. A late
+        delivery can name a record the source no longer returns: keyed on external_id."""
         try:
             execute(
                 self.conn,

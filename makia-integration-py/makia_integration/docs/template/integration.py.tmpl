@@ -200,6 +200,7 @@ class DbSink:
     def run_sent(self, record: Record, run: SentRun) -> None:
         # May come again for the same run after its final status (at-least-once): the
         # status goes back to "sent" only for a new run of the record, never for this one.
+        # A late delivery can name a record records() no longer returns: key on external_id.
         self._write(
             f"UPDATE record_runs SET status = 'sent', error_code = NULL "
             f"WHERE record_external_id = {PARAM} AND (run_id IS NULL OR run_id <> {PARAM})",

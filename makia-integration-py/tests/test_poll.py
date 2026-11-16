@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from makia_integration.integration import PROGRESS_READS_PER_POLL, PollReport
+from makia_integration.integration import PROGRESS_READS_PER_POLL, PollReport, SendError
 from makia_integration.client import ApiError
 from makia_integration.model import Record, RunRef
 from makia_integration.state import RunEntry
@@ -382,7 +382,7 @@ def test_events_wait_until_run_sent_was_delivered(integration, source, makia, st
     source._records = [REC]
     source._files = {REC.external_id: ["a.pdf"]}
     sink.fail_once("run_sent")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(SendError):
         integration.send()
     makia.set_rows("run-1", "mapping", [row("a")])
     makia.emit("run.succeeded", run_id="run-1", status="succeeded")
@@ -394,3 +394,33 @@ def test_events_wait_until_run_sent_was_delivered(integration, source, makia, st
     integration.poll()  # caught up from its progress
     assert names(sink) == ["run_sent", "run_status", "result_rows", "view_done"]
     assert state.run_by_id("run-1").status == "succeeded"
+
+
+def test_retry_of_a_gone_run_sends_the_record_again(started, makia, state, sink):
+    # 404 run_not_found also answers a run the caller cannot see for a moment
+    makia.delete_run("run-2")
+    started.poll()
+    assert state.run_by_id("run-2").status == "gone"
+    makia.cases[REC2.external_id] = {
+        "case_id": "case-2",
+        "run_id": "run-2",
+        "status_url": "/runs/run-2",
+        "review_url": "u",
+    }
+    makia.deleted_runs.discard("run-2")  # visible again
+    assert state.clear_refusals(REC2.external_id) == [REC2.external_id]
+    sink.calls.clear()
+    assert started.send().known == 1
+    assert state.run_by_record(REC2.external_id).status == "sent"
+    assert names(sink) == ["run_sent"]
+
+
+def test_pending_runs_take_no_progress_slot(started, makia, state):
+    for n in range(PROGRESS_READS_PER_POLL):
+        state.upsert_run(
+            RunEntry(f"P{n}", f"pc{n}", f"pending-{n}", None, "sent", None, True, None)
+        )
+    makia.calls.clear()
+    started.poll()
+    assert ("GET", "/runs/run-1/progress") in makia.calls
+    assert not any("/runs/pending-" in p for _, p in makia.calls)

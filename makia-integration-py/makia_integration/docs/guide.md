@@ -91,8 +91,8 @@ and `listen` stop with exit code 2 when both or neither are set (`doctor` shows 
 line). If `MAKIA_FILES_DIR` is set, files are uploaded and `files()` returns paths relative to
 that folder (an absolute path, or one that leaves the folder, is skipped). Otherwise `files()` returns paths in the storage connection.
 
-Commands: `sync`, `send`, `poll`, `run`, `listen`, `retry`, `doctor`, `new`,
-`docs`, `version`, `webhook`.
+Commands: `sync`, `send`, `poll`, `run`, `listen`, `retry`, `drop-pending`, `doctor`,
+`new`, `docs`, `version`, `webhook`.
 
 Exit codes: **0** done, **1** a job failed (MAKIA or your database could not be
 reached, an error in the integration, a project `sync` could not send), **2** configuration
@@ -147,7 +147,8 @@ You write one class for each. Both are plain classes; no base class is needed.
 `review_state`, `review_option`, `review_key` and `url`, the link into Studio.
 Status is one of `sent`, `running`, `succeeded`, `failed`, `cancelled`, or `gone`
 (the run was deleted in MAKIA; `error_code` is `run_not_found`, and the run is not
-read again).
+read again; `retry <id>` or `retry --all-gone` re-sends the record. If the case was
+deleted on purpose, this creates a new case and run).
 
 **Every sink method must be safe to call twice with the same arguments.** The
 package delivers at least once and never loses a call, so after a crash or an
@@ -158,7 +159,14 @@ What the package promises:
 
 - `send`: MAKIA answers, then the run is stored in the state file marked as not
   yet delivered, then `run_sent` is called, then the mark clears. If `run_sent`
-  raises, it is called again on the next pass.
+  raises, the log names the record, the pass goes on with the next record, `send`
+  ends with exit 1, and the call is made again on the next pass. `run_sent` and a
+  final `run_refused` (including `no_run`) come again even when the record is no
+  longer in `records()`: the record is then rebuilt from the state file, so key your
+  sink on `external_id` (an entry stored by an older makia-integration does not know
+  the other fields; they arrive empty, with a warning in the log).
+  A failed `record_skipped` or fixable `run_refused` comes again only while
+  `records()` still returns the record.
 - `poll`: for each page of the change feed the package updates its state and calls
   the sink, then moves the marker. If the sink raises, the marker stays, the poll
   stops, and the next poll repeats that page.
@@ -263,11 +271,12 @@ on every later pass and reports it each pass until it works.
 **Final**: the record itself is wrong. The package does not try it again and
 tells the sink once. Fix the file or the record, then clear the refusal:
 
-    makia-integration retry DOC-77812        # one record, by external id
-    makia-integration retry --all-refused    # every record refused for good
+    makia-integration retry DOC-77812        # one record, by external id: refused or gone
+    makia-integration retry --all-refused    # every record refused for good, and no_run
+    makia-integration retry --all-gone       # every gone run (a deleted case gets a new one)
 
-`retry` edits the state file only; the next `send` sends the record again
-(refusals for good and `no_run` records). It
+`retry` edits the state file only and prints the ids it cleared; the next `send`
+sends the record again (a `gone` run MAKIA can show again is picked up as `known`). It
 needs `MAKIA_STATE_FILE` (or the default file) and, like every command that uses
 the state file, the service must not be running at that moment.
 
@@ -413,10 +422,12 @@ Start with `makia-integration --env-file .env doctor`. Lines you may see in the 
 | `send <id>: refused (<code>)` | See "Refusals". |
 | `send <id>: MAKIA refused with an unlisted code <code> (N)` | A 4xx not in the lists; it is tried again every pass. See "Refusals". |
 | `send <id>: MAKIA knows it, but case <case> has no run any more (deleted) ...` | The sink heard `run_refused(record, "no_run")`. See `no_run` under "Refusals". |
-| `sync failed: ...` / `send failed: ...` / `poll failed: ...` | That step of a `run` round failed (the reason follows, in the same words as a one-shot command). The other steps still ran; the integration is built again for the next round. |
+| `sync failed: ...` / `send failed: ...` / `poll failed: ...` | That step of a `run` round failed (the reason follows, in the same words as a one-shot command). The other steps still ran; the integration is built again for the next round, except after `sync failed: N of M projects refused` (nothing to rebuild; fix the projects). |
+| `send <id>: run_sent failed (...); tried again next pass` | Your sink raised for that record (`run_refused` and `record_skipped` alike). The other records went on; `send` exits 1 with `N sink call(s) failed: ...`. Fix the cause; the call comes again next pass. |
 | `integration failed: ...` | The factory raised. It is called again next round; a configuration error (exit 2) or a state file in use ends `run`. |
 | `round failed` (with a traceback) | An error outside the steps, a bug: report it. |
-| `run <run> (record <id>) is gone from MAKIA: closed` | The run was deleted in MAKIA. The sink heard `run_status` with status `gone`; the run is not read again. |
+| `run <run> (record <id>) is gone from MAKIA: closed` | The run was deleted in MAKIA, or the run account could not see it at that moment (for example a membership change). The sink heard `run_status` with status `gone`; the run is not read again. If the run is still there, `retry <id>` sends the record again and the run is picked up. |
+| `send <id>: run_sent failed ...` every pass, for a record no longer in `records()` | The sink keeps refusing a delivery the state file still owes, and `run` rebuilds the integration every round. Once you have dealt with the record in your database, stop the service and run `makia-integration drop-pending <id>`: the state entry is deleted and the call is not made again. |
 | `results <run>/<view>: 404 view_not_found, skipped` | The view is no longer in the run's workflow. Nothing to do; the feed moves on. |
 | `poll: feed stuck at after=N while handling ...` | Your sink (or the integration) raised, often a `RuntimeError` or a database error on the next line. The poll stops, the marker stays, and the next poll repeats that page. Fix the cause. |
 | `progress <run>: ...` | MAKIA could not give the run's progress. Harmless; it is read again later. |

@@ -6,7 +6,8 @@ A timer and/or verified webhook deliveries only *kick* the worker; the integrati
 A round runs sync (when due), send and poll; a failing step is logged in one line
 and the round goes on with the next step. After a round with a failing step the
 integration is closed and the next round builds a new one, so a dropped connection
-inside the integration recovers.
+inside the integration recovers. A `SyncError` (some projects refused, the rest synced)
+is the exception: logged and kept in `last_error`, but the integration is kept.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import time
 from collections.abc import Callable
 from http.server import ThreadingHTTPServer
 
-from makia_integration.integration import Integration
+from makia_integration.integration import Integration, SyncError
 from makia_integration.receiver import PollCoalescer, make_server
 
 log = logging.getLogger("makia_integration")
@@ -133,7 +134,7 @@ class Runner:
         ]
         if sync_due:
             steps.insert(0, ("sync", integration.sync))
-        failed = cut = sync_tried = False
+        failed = rebuild = cut = sync_tried = False
         for name, step in steps:
             if self._stop.is_set():
                 cut = True
@@ -143,10 +144,13 @@ class Runner:
                 step()
             except Exception as err:
                 failed = True
+                # A per-project sync refusal (the rest synced) breaks no connection, and
+                # rebuilding every round would not fix it: keep the integration.
+                rebuild = rebuild or not isinstance(err, SyncError)
                 self._fail(name, err)
         if sync_tried or not sync_due:
             self._rounds += 1
-        if failed:
+        if rebuild:
             # A failure may have left a connection inside the integration broken: build a new
             # one next round (the factory opens the state file again, so close it first).
             self._integration = None
@@ -156,5 +160,5 @@ class Runner:
                     close()
                 except Exception:
                     log.debug("closing the integration failed", exc_info=True)
-        elif not cut:
+        if not failed and not cut:
             self.last_error = None

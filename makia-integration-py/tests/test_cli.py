@@ -275,6 +275,62 @@ def test_retry_clears_refusals(env, tmp_path, capsys, monkeypatch):
     assert "cleared 0" in capsys.readouterr().out
 
 
+def _state_with(path, *entries):
+    from makia_integration.state import RunEntry
+
+    store = SqliteStateStore(path)
+    for ext, status, pending in entries:
+        store.upsert_run(RunEntry(ext, "c-" + ext, "r-" + ext, None, status, None, pending, None))
+    store.close()
+
+
+def _left(path) -> list[str]:
+    store = SqliteStateStore(path)
+    try:
+        return [e for e in ("f", "n", "g", "s", "p") if store.run_by_record(e) is not None]
+    finally:
+        store.close()
+
+
+ENTRIES = (
+    ("f", "refused_final", False),
+    ("n", "no_run", False),
+    ("g", "gone", False),
+    ("s", "sent", False),
+    ("p", "sent", True),
+)
+
+
+def test_retry_all_refused_leaves_gone_and_all_gone_clears_it(env, tmp_path, capsys):
+    path = tmp_path / "state.db"
+    _state_with(path, *ENTRIES)
+    assert main(["retry", "--all-refused"]) == 0
+    out = capsys.readouterr().out
+    assert "cleared 2 refused record(s): f, n;" in out
+    assert _left(path) == ["g", "s", "p"]
+    assert main(["retry", "--all-gone"]) == 0
+    assert "cleared 1 gone record(s): g;" in capsys.readouterr().out
+    assert _left(path) == ["s", "p"]
+
+
+def test_retry_one_record_clears_gone(env, tmp_path, capsys):
+    path = tmp_path / "state.db"
+    _state_with(path, *ENTRIES)
+    assert main(["retry", "g"]) == 0
+    assert "cleared 1" in capsys.readouterr().out
+    assert _left(path) == ["f", "n", "s", "p"]
+
+
+def test_drop_pending_deletes_a_pending_entry_only(env, tmp_path, capsys):
+    path = tmp_path / "state.db"
+    _state_with(path, *ENTRIES)
+    assert main(["drop-pending", "s"]) == 1
+    assert "s has no pending sink call" in capsys.readouterr().err
+    assert main(["drop-pending", "p"]) == 0
+    assert "dropped p" in capsys.readouterr().out
+    assert _left(path) == ["f", "n", "g", "s"]
+
+
 def test_retry_needs_target(env):
     with pytest.raises(SystemExit) as exc:
         main(["retry"])
@@ -625,6 +681,16 @@ def test_sync_error_is_one_line_exit_1():
     err = SyncError(["a"], ["a (409 slug_taken)"], SyncReport(2, 0))
     assert cli._explain(err, {}, "sync") == (
         "sync failed: 1 of 2 projects refused: a (409 slug_taken)",
+        1,
+    )
+
+
+def test_send_error_is_one_line_exit_1():
+    from makia_integration.integration import SendError
+
+    err = SendError(["a (run_sent: RuntimeError: db down)"])
+    assert cli._explain(err, {}, "send") == (
+        "send failed: 1 sink call(s) failed: a (run_sent: RuntimeError: db down)",
         1,
     )
 
